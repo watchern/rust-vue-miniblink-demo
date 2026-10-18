@@ -2,6 +2,7 @@
   --bg: #f4f5f7;
   --panel: #ffffff;
   --panel-2: #fafbfc;
+  --hover-bg: #eceff4;
   --border: #e4e7ec;
   --border-strong: #d5d9e0;
   --text: #1f2328;
@@ -131,7 +132,7 @@ button {
   padding: 0 10px;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
-  background: #fff;
+  background: var(--panel);
   outline: none;
   user-select: text;
   transition: border-color .14s, box-shadow .14s;
@@ -300,4 +301,36 @@ pre.log .e {
   text-align: center;
   color: var(--text-3);
   font-size: 13px;
+}
+
+/* ---------- 暗色主题 ---------- */
+
+[data-theme="dark"] {
+  --bg: #14161b;
+  --panel: #1c1f26;
+  --panel-2: #23262e;
+  --hover-bg: #2c313b;
+  --border: #2b2f38;
+  --border-strong: #3a414d;
+  --text: #e7eaf0;
+  --text-2: #aab2c0;
+  --text-3: #7d8694;
+  --accent: #5b86f7;
+  --accent-soft: #233254;
+  --ok: #3fbf7a;
+  --ok-soft: #1c3329;
+  --warn: #dca24a;
+  --warn-soft: #382d18;
+  --err: #e36b62;
+  --err-soft: #3a2422;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .35), 0 4px 14px rgba(0, 0, 0, .35);
+}
+
+/* 暗色下把原本硬编码的浅色滚动条调暗一点 */
+[data-theme="dark"] ::-webkit-scrollbar-thumb {
+  background: #3a414d;
+}
+
+[data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
+  background: #4a5260;
 }

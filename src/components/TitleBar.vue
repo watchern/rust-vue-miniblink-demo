@@ -44,8 +44,8 @@ async function close() {
 <template>
   <header class="titlebar" @mousedown="onDrag">
     <div class="brand">
-      <svg class="logo" viewBox="0 0 24 24" width="19" height="19" aria-hidden="true">
-        <rect x="2" y="3.5" width="20" height="17" rx="3" fill="#3b6ef5" />
+      <svg class="logo" viewBox="0 0 24 24" width="24" height="24" aria-hidden="true">
+        <rect x="2" y="3.5" width="24" height="24" rx="3" fill="#3b6ef5" />
         <path d="M6.6 15.4 10.4 9.6l2.5 4 1.9-2.6 2.6 4.4" stroke="#fff" stroke-width="1.7"
           stroke-linecap="round" stroke-linejoin="round" fill="none" />
       </svg>
@@ -101,17 +101,17 @@ async function close() {
 .titlebar {
   display: flex;
   align-items: center;
-  height: 46px;
-  flex: 0 0 46px;
-  padding: 0 4px 0 14px;
-  background: #fff;
+  height: 30px;
+  flex: 0 0 30px;
+  padding: 0 4px 0 4px;
+  background: var(--panel);
   border-bottom: 1px solid var(--border);
 }
 
 .brand {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 4px;
   min-width: 0;
 }
 
@@ -123,18 +123,18 @@ async function close() {
 .titles {
   display: flex;
   align-items: baseline;
-  gap: 7px;
+  gap: 4px;
   min-width: 0;
 }
 
 .t1 {
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 650;
   white-space: nowrap;
 }
 
 .t2 {
-  font-size: 11.5px;
+  font-size: 11px;
   color: var(--text-3);
   white-space: nowrap;
 }
@@ -181,7 +181,7 @@ async function close() {
 }
 
 .win-btn:hover {
-  background: #eceff4;
+  background: var(--hover-bg);
   color: var(--text);
 }
 

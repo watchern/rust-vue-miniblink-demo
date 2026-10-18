@@ -194,17 +194,19 @@ def click_lang_button(hwnd: int) -> bool:
     """点击标题栏的语种切换按钮。
 
     坐标从 TitleBar.vue 的样式推算（而非硬编码绝对值）：
-      .titlebar 高 46、padding-right 4；.win-btns gap 2；
+      .titlebar 高 30（用户改过，最初 46）、padding-right 4；.win-btns gap 2；
       .win-btn 宽 34；.lang-btn 宽 40 + margin-right 6；
       从右往左依次是 close / max / min / lang。
+    ⚠️ 若再调 TitleBar.vue 的 .titlebar 高度，这里 TITLEBAR_H 要跟着改。
     """
+    TITLEBAR_H = 30
     cw, ch = client_size(hwnd)
     if cw < 300 or ch < 100:
         return False
     # 从右往左：close(34) + gap2 + max(34) + gap2 + min(34) + gap2 + lang 的 margin-right(6) + lang(40)
     from_right = 4 + 34 + 2 + 34 + 2 + 34 + 2 + 6 + 40
     x = cw - from_right + 40 // 2  # 按钮中心
-    y = 46 // 2
+    y = TITLEBAR_H // 2
     return click_client(hwnd, x, y)
 
 

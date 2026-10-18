@@ -10,14 +10,22 @@
  *   import { t, locale, setLocale, toggleLocale, LOCALE_LABEL } from './i18n'
  *   t('nav.dashboard')            // 取当前语种文案
  *   t('files.itemCount', { n: 3 })// 带参数插值
- *   setLocale('en-US')             // 切换（会写 localStorage 并同步 <html lang>）
+ *   setLocale('en-US')             // 切换（写 config.json 并同步 <html lang>）
+ *
+ * 持久化：界面语种与主题不再走 localStorage（那样换个安装目录就丢），
+ * 而是落到 exe 同级的 config.json，由 Rust 侧读写（见 app 的 config.get/set IPC），
+ * 这样「重开后还是默认中文」的问题从根上解决。
  */
 
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
+import { bridge } from '../bridge'
 
 export type Locale = 'zh-CN' | 'en-US'
 export const LOCALES: Locale[] = ['zh-CN', 'en-US']
-const STORAGE_KEY = 'mbvue.locale'
+
+/** 外观主题：浅色 / 暗色 / 跟随系统。 */
+export type Theme = 'light' | 'dark' | 'system'
+export const THEMES: Theme[] = ['light', 'dark', 'system']
 
 /** 文案表。key 用点分层级，方便按模块核对覆盖率。 */
 const DICT: Record<Locale, Record<string, string>> = {
@@ -52,6 +60,22 @@ const DICT: Record<Locale, Record<string, string>> = {
     'lang.switch': '切换到 English',
     'lang.current': '当前语种：简体中文',
     'lang.short': 'EN',
+
+    // ---- 设置 ----
+    'nav.settings': '设置',
+    'nav.settings.hint': '语言与主题',
+    'sub.settings': '界面语言与外观',
+    'settings.title': '设置',
+    'settings.sub': '调整界面语言与外观主题，修改后立即生效并保存到本机。',
+    'settings.lang': '界面语言',
+    'settings.langHint': '重开应用后保留此选择。',
+    'settings.theme': '外观主题',
+    'settings.themeHint': '「跟随系统」会随操作系统的明暗外观自动切换。',
+    'settings.lang.zh': '中文',
+    'settings.lang.en': 'English',
+    'settings.theme.light': '浅色',
+    'settings.theme.dark': '暗色',
+    'settings.theme.system': '跟随系统',
 
     // ---- 通用 ----
     'common.retry': '重试',
@@ -218,6 +242,22 @@ const DICT: Record<Locale, Record<string, string>> = {
     'lang.current': 'Current language: English',
     'lang.short': '中',
 
+    // ---- Settings ----
+    'nav.settings': 'Settings',
+    'nav.settings.hint': 'Language & theme',
+    'sub.settings': 'Interface language & appearance',
+    'settings.title': 'Settings',
+    'settings.sub': 'Adjust the interface language and appearance theme. Changes apply immediately and are saved locally.',
+    'settings.lang': 'Interface language',
+    'settings.langHint': 'This choice is kept after you restart the app.',
+    'settings.theme': 'Appearance theme',
+    'settings.themeHint': '"Follow system" switches automatically with the OS light/dark appearance.',
+    'settings.lang.zh': '中文',
+    'settings.lang.en': 'English',
+    'settings.theme.light': 'Light',
+    'settings.theme.dark': 'Dark',
+    'settings.theme.system': 'Follow system',
+
     // ---- Common ----
     'common.retry': 'Retry',
     'common.refresh': 'Refresh',
@@ -351,14 +391,12 @@ const DICT: Record<Locale, Record<string, string>> = {
   },
 }
 
-/** 首次进入时的语种：localStorage > 浏览器语言（中文环境给 zh，其余 en）。 */
+/**
+ * 首次进入时的语种（同步兜底）：仅看浏览器语言（中文环境给 zh，其余 en）。
+ * 真正的"上次选择"由 loadPersistedConfig() 异步从 config.json 读回并覆盖，
+ * 因为读盘要走 Rust 侧 IPC，无法在模块加载时同步完成。
+ */
 function detect(): Locale {
-  try {
-    const saved = localStorage.getItem(STORAGE_KEY)
-    if (saved === 'zh-CN' || saved === 'en-US') return saved
-  } catch {
-    /* 隐私模式下 localStorage 可能抛异常，忽略 */
-  }
   const nav = (typeof navigator !== 'undefined' ? navigator.language : 'en') || 'en'
   return /^zh/i.test(nav) ? 'zh-CN' : 'en-US'
 }
@@ -378,6 +416,58 @@ export const LOCALE_LABEL: Record<Locale, string> = {
   'zh-CN': 'EN',
   'en-US': '中',
 }
+
+// ---------------------------------------------------------------- 主题
+
+/**
+ * 系统是否处于暗色模式（响应式）。
+ * 仅当 theme==='system' 时才用它决定实际生效的主题，所以单独成 ref 以便
+ * 监听系统切换时实时重算，且不干扰 light/dark 的显式选择。
+ */
+const systemDark = ref<boolean>(
+  typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(prefers-color-scheme: dark)').matches,
+)
+
+if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+  const mql = window.matchMedia('(prefers-color-scheme: dark)')
+  const onSysChange = (e: MediaQueryListEvent) => {
+    systemDark.value = e.matches
+    applyTheme()
+  }
+  if (typeof mql.addEventListener === 'function') mql.addEventListener('change', onSysChange)
+  else if (typeof mql.addListener === 'function') mql.addListener(onSysChange)
+}
+
+/** 用户选择的外观主题（默认跟随系统）。 */
+export const theme = ref<Theme>('system')
+
+/** 实际生效的主题：跟随系统按 OS 当前外观解析成 light/dark。 */
+export const effectiveTheme = computed<Theme>(() =>
+  theme.value === 'system' ? (systemDark.value ? 'dark' : 'light') : theme.value,
+)
+
+/**
+ * 把生效主题写到 <html data-theme> 上，CSS 据此切换变量。
+ * light 也显式写属性（而非仅靠 :root 默认），方便 HMR / 调试一眼看清状态。
+ */
+export function applyTheme() {
+  if (typeof document === 'undefined') return
+  document.documentElement.setAttribute('data-theme', effectiveTheme.value)
+}
+
+// 把「生效主题」（跟随系统时已解析成 light/dark）同步给壳：让壳的 WM_ERASEBKGND
+// 兜底背景色跟着变——webview 铺满客户区，但启动瞬间/缩放过程中 webview 未及时
+// 重画时会闪一下类背景色，暗色下不能是白的。
+// immediate 覆盖启动；切主题 / 系统明暗变化都会经这里反应到壳。
+watch(
+  effectiveTheme,
+  (eff) => {
+    void bridge.setTheme(eff).catch(() => {})
+  },
+  { immediate: true },
+)
 
 function interpolate(tpl: string, params?: Record<string, unknown>): string {
   if (!params) return tpl
@@ -399,23 +489,53 @@ export function t(key: string, params?: Record<string, unknown>): string {
   return interpolate(s, params)
 }
 
-/** 切换到指定语种：更新响应式状态 + 落盘 + 同步 <html lang>。 */
+/** 切换到指定语种：更新响应式状态 + 落盘到 config.json + 同步 <html lang>。 */
 export function setLocale(next: Locale) {
   current.value = next
-  try {
-    localStorage.setItem(STORAGE_KEY, next)
-  } catch {
-    /* 忽略 */
-  }
   if (typeof document !== 'undefined') {
     document.documentElement.setAttribute('lang', next)
   }
+  // 持久化到 config.json（由 Rust 侧写入 exe 同级），重开后保留。
+  void bridge.configSet({ locale: next }).catch(() => {})
 }
 
 /** 中英互切。返回切换后的语种，便于调用方做联动（如同步窗口标题）。 */
 export function toggleLocale(): Locale {
   setLocale(otherLocale.value)
   return current.value
+}
+
+/** 切换主题：更新状态 + 落盘 + 立即套用到 <html data-theme>。 */
+export function setTheme(next: Theme) {
+  theme.value = next
+  applyTheme()
+  void bridge.configSet({ theme: next }).catch(() => {})
+}
+
+/**
+ * 启动后从 config.json 读回上次的语种 / 主题并应用（解决"重开回到默认中文"）。
+ * 异步：读盘走 Rust IPC，模块加载时还拿不到，所以由 App 在挂载后调用。
+ */
+export async function loadPersistedConfig(): Promise<void> {
+  try {
+    const cfg = (await bridge.configGet()) as Record<string, unknown> | undefined
+    if (cfg && typeof cfg === 'object') {
+      const savedLocale = cfg.locale
+      if (savedLocale === 'zh-CN' || savedLocale === 'en-US') {
+        current.value = savedLocale
+        if (typeof document !== 'undefined') {
+          document.documentElement.setAttribute('lang', savedLocale)
+        }
+      }
+      const savedTheme = cfg.theme
+      if (savedTheme === 'light' || savedTheme === 'dark' || savedTheme === 'system') {
+        theme.value = savedTheme
+      }
+    }
+  } catch {
+    /* 读不到就用默认值，不阻塞启动 */
+  }
+  applyTheme()
 }
 
 /** 供覆盖率自检用：列出某个语种缺失的 key。 */
@@ -426,4 +546,6 @@ export function missingKeys(l: Locale): string[] {
 
 if (typeof document !== 'undefined') {
   document.documentElement.setAttribute('lang', current.value)
+  // 初始主题也要落一次 data-theme（默认跟随系统）。
+  applyTheme()
 }

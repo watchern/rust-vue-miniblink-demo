@@ -155,6 +155,9 @@ function mockInvoke<T>(cmd: string, payload: unknown): Promise<T> {
   })
 }
 
+// 浏览器调试（非 miniblink）时用来"假装"持久化配置，保证前端行为一致。
+const mockConfigStore: Record<string, unknown> = { locale: 'zh-CN', theme: 'system' }
+
 function mockExec(cmd: string, p: Record<string, unknown>): unknown {
   switch (cmd) {
     case 'app.info':
@@ -174,6 +177,13 @@ function mockExec(cmd: string, p: Record<string, unknown>): unknown {
       }
     case 'app.setLocale':
       return { locale: p.locale ?? 'zh-CN' }
+    case 'app.setTheme':
+      return { theme: p.theme ?? 'light' }
+    case 'config.get':
+      return { ...mockConfigStore }
+    case 'config.set':
+      Object.assign(mockConfigStore, p)
+      return { ...mockConfigStore }
     case 'sys.info':
       return {
         host: 'MOCK-HOST',
@@ -316,6 +326,11 @@ export const bridge = {
   appInfo: () => invoke<AppInfo>('app.info'),
   // 把语种同步给壳，让 IPC 返回的错误文案也跟随界面语言
   setLocale: (locale: string) => invoke<{ locale: string }>('app.setLocale', { locale }),
+  // 把「生效主题」同步给壳：它会据此给无边框窗口那圈背景留白上色，暗色不露白边
+  setTheme: (theme: string) => invoke<{ theme: string }>('app.setTheme', { theme }),
+  // 持久化配置（界面语种 / 主题）：读全量、写顶层键合并
+  configGet: () => invoke<Record<string, unknown>>('config.get'),
+  configSet: (patch: Record<string, unknown>) => invoke<Record<string, unknown>>('config.set', patch),
   sysInfo: () => invoke<SysInfo>('sys.info'),
   memory: () => invoke<{ total: number; used: number; available: number }>('sys.memory'),
 

@@ -19,6 +19,7 @@ use std::sync::OnceLock;
 use serde_json::{json, Value};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi;
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
@@ -28,8 +29,10 @@ const WS_POPUP: u32 = 0x8000_0000;
 const WS_MINIMIZEBOX: u32 = 0x0002_0000;
 const WS_MAXIMIZEBOX: u32 = 0x0001_0000;
 // 有它窗口才有 resize 边框：WS_POPUP 窗口默认不可拖拽缩放，
-// 无边框 UI 靠 miniblink 的 ncHittestPaddingWidth 做边缘命中测试。
+// 边缘命中测试由前端 ResizeHandle 组件负责。
 const WS_THICKFRAME: u32 = 0x0004_0000;
+const WS_CAPTION: u32 = 0x00C0_0000;
+const WS_SYSMENU: u32 = 0x0008_0000;
 const WS_EX_APPWINDOW: u32 = 0x0004_0000;
 
 const WIN_W: i32 = 1180;
@@ -39,8 +42,21 @@ const WIN_H: i32 = 760;
 pub(crate) const WIN_MIN_W: i32 = 900;
 pub(crate) const WIN_MIN_H: i32 = 600;
 
-const GWL_WNDPROC: i32 = -4;
 const WM_GETMINMAXINFO: u32 = 0x0024;
+const WM_NCCALCSIZE: u32 = 0x0083;
+const WM_NCHITTEST: u32 = 0x0084;
+
+// ---- WM_NCHITTEST 命中区返回值（wnd_proc 返回 LRESULT = isize）----
+const HTCLIENT: isize = 1;
+const HTLEFT: isize = 10;
+const HTRIGHT: isize = 11;
+const HTBOTTOM: isize = 15;
+const HTBOTTOMLEFT: isize = 16;
+const HTBOTTOMRIGHT: isize = 17;
+// ---- GetSystemMetrics 索引：无边框窗口的边框命中带宽 ----
+const SM_CXSIZEFRAME: i32 = 32;
+const SM_CYSIZEFRAME: i32 = 33;
+const SM_CXPADDEDBORDER: i32 = 92;
 
 // ---- 自定义窗口消息 ----
 const WM_TRAY: u32 = 0x8000 + 1; // 托盘图标回调
@@ -53,6 +69,7 @@ const SC_MINIMIZE: u32 = 0xF020;
 /// 子类化前的原窗口过程（miniblink 自己装的）
 static PREV_WND_PROC: AtomicIsize = AtomicIsize::new(0);
 
+
 /// 宿主窗口句柄（on_document_ready 的尺寸保险要用）
 static WINDOW_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
@@ -63,7 +80,27 @@ static TRAY_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mu
 /// 运行时数据目录（解析一次后缓存；默认 exe 同级，Program Files 不可写时回退 LOCALAPPDATA）
 static USER_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// WM_ERASEBKGND 兜底上色用的背景色是否用暗色（webview 铺满客户区后，
+/// 只有启动瞬间/缩放过程中 webview 未及时重画时才会露出一角）。
+/// 由前端在主题生效时经 app.setTheme 同步过来（启动时也先从 config.json 读一次）。
+static FRAME_DARK: AtomicBool = AtomicBool::new(false);
+
+/// WM_ERASEBKGND 兜底涂色的 COLORREF（0x00BBGGRR），跟随页面 --bg：
+/// 暗色下 #14161b，浅色下 #f4f5f7。
+fn frame_colors() -> u32 {
+    if FRAME_DARK.load(Ordering::Relaxed) {
+        0x001b_1614 // 暗：#14161b
+    } else {
+        0x00f7_f5f4 // 浅：#f4f5f7
+    }
+}
+
 /// 子类化窗口过程：
+///   · WM_NCCALCSIZE —— 客户区 = 整个窗口矩形（消灭 WS_THICKFRAME 的 7px
+///     非客户区边框环；那圈不涂色，暗色下透出桌面/阴影/背后窗口显白边）
+///   · WM_NCHITTEST —— 自算边框命中区：顶部整条给标题栏（JS 拖拽+窗口按钮），
+///     左右下边框+底部两角给系统原生缩放
+///   · WM_SETCURSOR —— 边框缩放区配系统缩放光标
 ///   · WM_GETMINMAXINFO  —— 限制最小跟踪尺寸
 ///   · WM_SYSCOMMAND(SC_MINIMIZE) / WM_APP_MINIMIZE —— 收进托盘（隐藏窗口）
 ///   · WM_APP_EXIT / WM_DESTROY —— 退出进程
@@ -99,6 +136,128 @@ unsafe extern "system" fn wnd_proc(
             (mb.mbExitMessageLoop)();
             win::PostQuitMessage(0);
             return 0;
+        }
+        win::WM_ERASEBKGND => {
+            // webview 铺满客户区，正常情况看不到这里的绘制；但启动瞬间/缩放
+            // 过程中 webview 未及时重画时会闪一下类背景色，涂一层主题色兜底。
+            let hdc = wparam as Gdi::HDC;
+            let mut r: RECT = std::mem::zeroed();
+            if !hdc.is_null() && win::GetClientRect(hwnd, &mut r) != 0 {
+                let brush = Gdi::CreateSolidBrush(frame_colors());
+                if !brush.is_null() {
+                    Gdi::FillRect(hdc, &r, brush);
+                    Gdi::DeleteObject(brush);
+                }
+            }
+            return 1; // 非零 = 已擦背景，别让默认过程再用浅色类刷子涂
+        }
+        WM_NCCALCSIZE => {
+            // 无边框可缩放窗口的标准做法（Electron/Chromium frame:false 同款）：
+            // 客户区 = 整个窗口矩形。DefWindowProc 的默认行为会按 WS_THICKFRAME
+            // 扣出一圈 ~7px 非客户区边框，而那圈系统不涂色——暗色主题下左侧透出
+            // 桌面、下/右侧透出 DWM 阴影显浅灰、顶部透出背后的窗口显白，
+            // 正是"暗色下顶部/底部/右侧一圈白边"的根源。扣掉后 webview 直接
+            // 铺满整个窗口，四边颜色完全由页面绘制。边缘缩放命中测试改到
+            // WM_NCHITTEST 里自己算，与客户区大小无关。
+            //
+            // 注意：光有本处理还不够——miniblink 的 webview 渲染视口会按窗口
+            // **样式**算内边距。创建时若带 WS_THICKFRAME，视口从出生就内嵌
+            // 7px（定位在 (7,7)），之后没有任何 API 改得回来；子类化后只补
+            // WS_THICKFRAME（无 CAPTION）也一样。正解是「创建时不带
+            // WS_THICKFRAME + 子类化后补 WS_THICKFRAME|WS_CAPTION|WS_SYSMENU」
+            // （见 main 里创建窗口处的注释），视口从出生就铺满。
+            if wparam != 0 {
+                // wparam=TRUE 时 lparam 指向 NCCALCSIZE_PARAMS，rgrc[0] 是
+                // 建议客户区（屏幕坐标）。最大化时系统会把窗口矩形撑大到工作
+                // 区之外（好让默认客户区正好落在工作区内），必须把 rgrc[0]
+                // 钳回工作区，否则客户区比可见区大一圈：UI 整体偏移、右上角
+                // 按钮被屏幕边缘裁掉。
+                let params = &mut *(lparam as *mut win::NCCALCSIZE_PARAMS);
+                if win::IsZoomed(hwnd) != 0 {
+                    let hmon = Gdi::MonitorFromWindow(hwnd, 2); // MONITOR_DEFAULTTONEAREST
+                    if !hmon.is_null() {
+                        let mut mi: Gdi::MONITORINFO = std::mem::zeroed();
+                        mi.cbSize = std::mem::size_of::<Gdi::MONITORINFO>() as u32;
+                        if Gdi::GetMonitorInfoW(hmon, &mut mi) != 0 {
+                            params.rgrc[0] = mi.rcWork;
+                        }
+                    }
+                }
+            }
+            return 0;
+        }
+        WM_NCHITTEST => {
+            // 自己算边框命中区（实测验证过的完整链路）：
+            //   · 顶部 yf 整带给 HTCLIENT——那一带整个是标题栏，JS 拖拽
+            //     （win.drag 伪造 WM_NCLBUTTONDOWN+HTCAPTION）和右上角窗口
+            //     按钮都靠 webview 收鼠标事件；若交给系统会变成 HTTOP 缩放
+            //     区，顶部一条既拖不动也点不中按钮；
+            //   · 左/右/下边框与底部两角给 HTLEFT/HTRIGHT/HTBOTTOM/
+            //     HTBOTTOM*——随后的 WM_NCLBUTTONDOWN 经 miniblink 透传到
+            //     DefWindowProc，原生 resize 模态循环启动（实测：命中→按下→
+            //     窗口尺寸精确跟随鼠标，EVENT_SYSTEM_MOVESIZESTART/END 齐全）；
+            //   · 其余 HTCLIENT，鼠标事件进 webview。
+            //   yf 的两个分量都取 SM_CX* 版本：本机 GetSystemMetrics
+            //   (SM_CYPADDEDBORDER=93) 返回垃圾值 648，纵方向用它会把命中带
+            //   撑到 652px、整个窗口变成"顶部条"（踩过）。
+            let mut pt = POINT {
+                x: (lparam & 0xFFFF) as i16 as i32,
+                y: ((lparam >> 16) & 0xFFFF) as i16 as i32,
+            };
+            if Gdi::ScreenToClient(hwnd, &mut pt) != 0 {
+                let mut cr: RECT = std::mem::zeroed();
+                if win::GetClientRect(hwnd, &mut cr) != 0
+                    && pt.x >= cr.left
+                    && pt.x < cr.right
+                    && pt.y >= cr.top
+                    && pt.y < cr.bottom
+                {
+                    let xf = win::GetSystemMetrics(SM_CXSIZEFRAME)
+                        + win::GetSystemMetrics(SM_CXPADDEDBORDER);
+                    // 注意：纵方向也用 SM_CXPADDEDBORDER——本机
+                    // GetSystemMetrics(SM_CYPADDEDBORDER=93) 返回垃圾值 648，
+                    // 直接用会把命中带撑到 652px，整个窗口都变成"顶部条"。
+                    let yf = win::GetSystemMetrics(SM_CYSIZEFRAME)
+                        + win::GetSystemMetrics(SM_CXPADDEDBORDER);
+                    let hit: isize = if pt.y < cr.top + yf {
+                        HTCLIENT // 顶部整条：标题栏地盘
+                    } else if pt.y >= cr.bottom - yf {
+                        if pt.x < cr.left + xf {
+                            HTBOTTOMLEFT
+                        } else if pt.x >= cr.right - xf {
+                            HTBOTTOMRIGHT
+                        } else {
+                            HTBOTTOM
+                        }
+                    } else if pt.x < cr.left + xf {
+                        HTLEFT
+                    } else if pt.x >= cr.right - xf {
+                        HTRIGHT
+                    } else {
+                        HTCLIENT
+                    };
+                    return hit;
+                }
+            }
+            // 视野外或异常：交回原过程
+        }
+        win::WM_SETCURSOR => {
+            // lparam 低字是当前命中区。边框缩放区给系统缩放光标（原生观感），
+            // 其余（HTCLIENT 等）交回原过程，webview 自己管光标。
+            let hit = (lparam & 0xFFFF) as u16 as isize;
+            let idi = match hit {
+                HTLEFT | HTRIGHT => 32644,             // IDC_SIZEWE
+                HTBOTTOM => 32645,                     // IDC_SIZENS
+                HTBOTTOMLEFT | HTBOTTOMRIGHT => 32642, // IDC_SIZENWSE
+                _ => 0,
+            };
+            if idi != 0 {
+                let cur = win::LoadCursorW(std::ptr::null_mut(), idi as *const u16);
+                if !cur.is_null() {
+                    win::SetCursor(cur);
+                }
+                return 1; // TRUE：已处理，别再走默认类光标
+            }
         }
         WM_TRAY => match lparam as u32 {
             0x0205 | 0x007B => show_tray_menu(hwnd), // WM_RBUTTONUP / WM_CONTEXTMENU
@@ -197,11 +356,27 @@ fn main() {
     let win_w = rect.right - rect.left;
     let win_h = rect.bottom - rect.top;
 
+    // 启动即按 config.json 的主题给窗口那圈背景留白定色：暗色用户冷启时不露白边。
+    // theme=system 这里先按浅色（前端 matchMedia 会立刻经 app.setTheme 纠正生效主题）。
+    let cfg0 = read_config();
+    let saved_theme = cfg0.get("theme").and_then(|v| v.as_str()).unwrap_or("");
+    FRAME_DARK.store(saved_theme == "dark", Ordering::Relaxed);
+
     // ---- 4. 创建无边框窗口 ----
+    // 注意：创建时**故意不带 WS_THICKFRAME**。miniblink 的 webview 渲染视口
+    // 按窗口样式算内边距：创建时若带 WS_THICKFRAME，DefWindowProc 的
+    // WM_NCCALCSIZE 会扣出一圈 7px 边框，视口就按那个「带边框的客户区」
+    // 初始化并缓存（定位在 (7,7)）——之后无论怎么 mbMoveWindow / 补发
+    // WM_SIZE 都改不回来（实测：补发合成 WM_SIZE 被按旧尺寸跳过；渲染器
+    // 进程就绪后还会再重置一次），四边各露一圈未涂色带，暗色主题下透出
+    // 桌面/背后的窗口显白/灰边——正是用户报告的"暗色下顶部/底部/右侧白边"。
+    // 无边框创建 → 创建时客户区就是整个窗口 → 视口从出生就是对的。
+    // 边框样式在子类化后补（见下）：补齐后视口依然铺满（补 CAPTION 是关键，
+    // 只补 THICKFRAME 无 CAPTION 时视口仍会内嵌 7px——实测四种组合得出）。
     let view = unsafe {
         (mb.mbCreateWebCustomWindow)(
             std::ptr::null_mut() as HWND,
-            WS_POPUP | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME,
+            WS_POPUP | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
             WS_EX_APPWINDOW,
             rect.left,
             rect.top,
@@ -223,6 +398,31 @@ fn main() {
             win::SetWindowLongPtrW(hwnd, win::GWL_WNDPROC, wnd_proc as *const () as isize)
         };
         PREV_WND_PROC.store(prev, Ordering::Relaxed);
+        // 子类化后补上 WS_THICKFRAME | WS_CAPTION | WS_SYSMENU（Electron/Chromium
+        // frame:false 同款组合）：
+        //   · WS_THICKFRAME —— 系统原生 resize 边框命中（WM_NCHITTEST 自算命中区
+        //     走它）、最大化窗口矩形撑大；
+        //   · WS_CAPTION —— DWM 阴影、最大化动画、Win+方向键贴靠都要求样式里有
+        //     标题栏位；标题栏本身由 WM_NCCALCSIZE 划进客户区，不可见；
+        //   · WS_SYSMENU —— Alt+空格 系统菜单等标准行为。
+        // 实测：只补 WS_THICKFRAME（无 CAPTION）时 miniblink 的渲染视口会按
+        // 「带边框客户区」内嵌 ~7px，四边各露一圈未涂色带（暗色下显白/灰边，
+        // 即用户报告的"暗色主题顶部/底部/右侧白边"）；补上 CAPTION 后视口铺满。
+        // 补样式位会让系统重算一次 NCCALCSIZE——我们的处理恒返回「客户区 =
+        // 整个窗口」，所以客户区不变，但系统/DWM 会按新样式重新评估阴影与边框。
+        unsafe {
+            let style = win::GetWindowLongPtrW(hwnd, win::GWL_STYLE) as u32;
+            win::SetWindowLongPtrW(hwnd, win::GWL_STYLE, (style | WS_THICKFRAME | WS_CAPTION | WS_SYSMENU) as isize);
+            win::SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020, // SWP_NOSIZE|SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_FRAMECHANGED
+            );
+        }
         // 任务栏 / 标题栏 / Alt+Tab 图标（必须在窗口所在线程做）
         unsafe { set_window_icon(hwnd) };
         // 运行期常驻托盘图标（解决"右下角托盘也没有"）
@@ -238,14 +438,24 @@ fn main() {
         // 默认 exe 同级；若装在 Program Files 等不可写位置，自动回退到 %LOCALAPPDATA%\mbvue。
         // 两者都由卸载器清理（见 scripts/make_installer.nsi）。
         setup_user_data(mb, view);
-        // 无边框窗口：留出 6px 边缘用于拉伸，并转发给 miniblink 处理命中测试
-        let k1 = ffi::cstr("ncHittestPaddingWidth");
-        let v1 = ffi::cstr("6");
-        (mb.mbSetDebugConfig)(view, k1.as_ptr() as *const c_char, v1.as_ptr() as *const c_char);
+        // 不设 ncHittestPaddingWidth，也不留非客户区边框环（WM_NCCALCSIZE 已把
+        // 客户区扩到整个窗口）：那圈留白会被 miniblink 内部涂成固定色（顶部白、
+        // 左侧黑），暗色主题下露一圈白边——实测无解。现在 webview 铺满整个窗口，
+        // 四边颜色完全由页面绘制。缩放由 WM_NCHITTEST 自算的边框命中区（左右下 +
+        // 底部两角，系统原生）+ 前端 ResizeHandle 把手共同完成。
         (mb.mbSetNavigationToNewWindowEnable)(view, 0);
         (mb.mbSetCspCheckEnable)(view, 0);
         (mb.mbSetDragEnable)(view, 0);
-        (mb.mbResize)(view, win_w, win_h);
+        // 不设 ncHittestPaddingWidth，也不留非客户区边框环（WM_NCCALCSIZE 已把
+        // 客户区扩到整个窗口）：那圈留白会被 miniblink 内部涂成固定色（顶部白、
+        // 左侧黑），暗色主题下露一圈白边——实测无解。现在 webview 铺满整个窗口，
+        // 四边颜色完全由页面绘制。缩放由 WM_NCHITTEST 自算的边框命中区（左右下 +
+        // 底部两角，系统原生）+ 前端 ResizeHandle 把手共同完成。
+        //
+        // 注意：**不要**在启动时调 mbMoveWindow(view, 0, 0, ...)。它的 x/y 是
+        // 屏幕坐标，会把宿主窗口从居中位置挪到屏幕 (0,0)（实测踩过）；
+        // 而无边框创建时客户区本就是整个窗口，webview 视口从出生就是对的，
+        // 不需要任何启动期布局调用。
         (mb.mbShowWindow)(view, 1);
     }
 
@@ -387,9 +597,42 @@ fn default_rect() -> RECT {
     RECT { left: x, top: y, right: x + w, bottom: y + h }
 }
 
-/// 记住窗口尺寸的文件（落在用户数据目录）
-fn geom_path() -> PathBuf {
-    user_data_dir().join("mbvue.window.json")
+/// 配置文件（落在用户数据目录）。窗口尺寸放在 `window` 段下，
+/// 顶层还可扩展其它配置项（主题、启动页等），保存时只改 `window` 段、保留其余键。
+fn config_path() -> PathBuf {
+    user_data_dir().join("config.json")
+}
+
+/// 读取整份配置（缺省返回空对象）。
+///
+/// 与 `save_geom` 共用 `config.json`：窗口尺寸在 `window` 段下，
+/// 其它配置项（locale / theme 等）都在顶层，互不干扰。
+pub(crate) fn read_config() -> Value {
+    std::fs::read_to_string(config_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
+}
+
+/// 把 patch 的顶层键合并进 config.json 并写回（保留 `window` 等其它段）。
+///
+/// 前端只 Patch `{ locale, theme }` 这类顶层键，所以顶层浅合并即可：
+/// 既不会误删 `window` 段（窗口尺寸记忆），也不会要求前端传回整份配置。
+pub(crate) fn merge_config(patch: &Value) -> Value {
+    let path = config_path();
+    let mut root = read_config();
+    if !root.is_object() {
+        root = Value::Object(serde_json::Map::new());
+    }
+    if let (Some(obj), Some(p)) = (root.as_object_mut(), patch.as_object()) {
+        for (k, v) in p {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&root) {
+        let _ = std::fs::write(&path, s);
+    }
+    root
 }
 
 fn save_geom(hwnd: HWND) {
@@ -407,20 +650,47 @@ fn save_geom(hwnd: HWND) {
         if w < WIN_MIN_W || h < WIN_MIN_H {
             return;
         }
-        let data = json!({ "x": r.left, "y": r.top, "w": w, "h": h });
-        if let Ok(s) = serde_json::to_string_pretty(&data) {
-            let _ = std::fs::write(geom_path(), s);
+        // 读-改-写：只更新 `window` 段，保留 config.json 里其它配置项（便于后期扩展）
+        let path = config_path();
+        let mut root: Value = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(Value::Object(serde_json::Map::new()));
+        if !root.is_object() {
+            root = Value::Object(serde_json::Map::new());
+        }
+        root["window"] = json!({ "x": r.left, "y": r.top, "w": w, "h": h });
+        if let Ok(s) = serde_json::to_string_pretty(&root) {
+            let _ = std::fs::write(&path, s);
         }
     }
 }
 
 fn load_geom() -> Option<RECT> {
-    let s = std::fs::read_to_string(geom_path()).ok()?;
+    // 优先 config.json（window 段）；兼容旧版 mbvue.window.json（扁平 x/y/w/h）
+    let legacy_path = user_data_dir().join("mbvue.window.json");
+    let (s, legacy) = match std::fs::read_to_string(config_path()) {
+        Ok(s) => (s, false),
+        Err(_) => match std::fs::read_to_string(&legacy_path) {
+            Ok(s) => (s, true),
+            Err(_) => return None,
+        },
+    };
     let v: Value = serde_json::from_str(&s).ok()?;
-    let x = v.get("x")?.as_i64()? as i32;
-    let y = v.get("y")?.as_i64()? as i32;
-    let w = v.get("w")?.as_i64()? as i32;
-    let h = v.get("h")?.as_i64()? as i32;
+    let win_node = if legacy { v.clone() } else { v.get("window")?.clone() };
+    let x = win_node.get("x")?.as_i64()? as i32;
+    let y = win_node.get("y")?.as_i64()? as i32;
+    let w = win_node.get("w")?.as_i64()? as i32;
+    let h = win_node.get("h")?.as_i64()? as i32;
+    // 旧版文件迁移到 config.json，并删除旧文件
+    if legacy {
+        let mut root = serde_json::Value::Object(serde_json::Map::new());
+        root["window"] = json!({ "x": x, "y": y, "w": w, "h": h });
+        if let Ok(out) = serde_json::to_string_pretty(&root) {
+            let _ = std::fs::write(config_path(), out);
+            let _ = std::fs::remove_file(&legacy_path);
+        }
+    }
     if w < WIN_MIN_W || h < WIN_MIN_H {
         return None;
     }
@@ -493,6 +763,8 @@ unsafe extern "system" fn on_document_ready(
 ) {
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_millis(350));
+        // 兜底：若窗口仍超出工作区（被任务栏/屏幕边缘切掉），拉回。
+        // 现在默认尺寸按工作区算、首帧就正确，这里只做保险。
         ensure_window_ok();
         ipc::emit("ready", serde_json::json!({ "from": "rust" }));
     });
@@ -666,7 +938,11 @@ unsafe fn setup_user_data(mb: &ffi::Mb, view: ffi::MbWebView) {
     // 这几个 API 收 WCHAR*（UTF-16），用 OsStr 转换以正确处理非 ASCII 路径
     let wide = |p: &Path| p.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>();
 
-    let ls = wide(&dir);
+    // LocalStorage 放进 LocalStorage\ 子目录（miniblink 默认就是这么放的），
+    // 不要把 *.localsto 散落在 exe 同级根目录。cookie / 磁盘缓存仍是单文件/单目录，留在根。
+    let ls_dir = dir.join("LocalStorage");
+    let _ = std::fs::create_dir_all(&ls_dir);
+    let ls = wide(&ls_dir);
     (mb.mbSetLocalStorageFullPath)(view, ls.as_ptr());
 
     let jar = wide(&dir.join("cookies.dat"));
@@ -735,4 +1011,48 @@ fn find_web_root() -> Option<PathBuf> {
         cands.push(PathBuf::from(n));
     }
     cands.into_iter().find(|p| Path::new(p).join("index.html").exists())
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    /// user_data_dir 的 OnceLock 是进程级全局，用锁把用例串起来避免并发干扰。
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// config.json 的「读-合并-写」必须只动被 patch 的顶层键，
+    /// 保住 save_geom 写的 `window` 段（窗口尺寸记忆）不被前端刷掉。
+    #[test]
+    fn merge_config_round_trip_preserves_window() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // 指到临时目录，绝不碰真实用户数据
+        let tmp = std::env::temp_dir().join(format!("mbvue-cfg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("MB_USER_DATA", &tmp);
+
+        // 该测试是本 crate 里唯一调用 user_data_dir 的用例，首次解析即命中 tmp
+        assert_eq!(user_data_dir(), tmp);
+
+        // ① 先按 save_geom 的形态落一个 window 段
+        let initial = json!({ "window": { "x": 10, "y": 20, "w": 1180, "h": 760 } });
+        std::fs::write(config_path(), serde_json::to_string_pretty(&initial).unwrap()).unwrap();
+
+        // ② 前端 patch 顶层 locale / theme，window 必须原样保留
+        let out = merge_config(&json!({ "locale": "en-US", "theme": "dark" }));
+        assert_eq!(out["locale"], "en-US");
+        assert_eq!(out["theme"], "dark");
+        assert_eq!(out["window"]["w"], 1180);
+
+        // ③ 再从盘上读回，确认落盘内容一致（前端 loadPersistedConfig 走这条路径）
+        let back = read_config();
+        assert_eq!(back["locale"], "en-US");
+        assert_eq!(back["theme"], "dark");
+        assert_eq!(back["window"]["x"], 10);
+        assert_eq!(back["window"]["h"], 760);
+
+        // 清理现场
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("MB_USER_DATA");
+    }
 }

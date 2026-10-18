@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import TitleBar from './components/TitleBar.vue'
 import SideBar from './components/SideBar.vue'
 import ResizeHandle from './components/ResizeHandle.vue'
@@ -8,7 +8,8 @@ import SystemView from './views/SystemView.vue'
 import FilesView from './views/FilesView.vue'
 import BridgeView from './views/BridgeView.vue'
 import AboutView from './views/AboutView.vue'
-import { t, locale, toggleLocale } from './i18n'
+import SettingsView from './views/SettingsView.vue'
+import { t, locale, toggleLocale, loadPersistedConfig } from './i18n'
 import { bridge } from './bridge'
 
 const views = {
@@ -16,6 +17,7 @@ const views = {
   system: SystemView,
   files: FilesView,
   bridge: BridgeView,
+  settings: SettingsView,
   about: AboutView,
 } as const
 
@@ -47,6 +49,12 @@ watch(
 function onToggleLocale() {
   toggleLocale()
 }
+
+// 启动后从 config.json 读回上次保存的语种 / 主题（解决"重开回到默认中文"）。
+// 放在 onMounted：读盘走 Rust IPC，页面挂载、桥接就绪后再读最稳。
+onMounted(() => {
+  void loadPersistedConfig().catch(() => {})
+})
 </script>
 
 <template>

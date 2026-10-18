@@ -66,10 +66,27 @@ npm run dev    # 浏览器打开 http://127.0.0.1:5173
 1. `libloading` 加载 `mb132_x64.dll`，逐个解析 `mb*` 符号
 2. `mbInit(null)`
 3. 起本地 HTTP 服务，把 `build_dist` 暴露在 `http://127.0.0.1:<随机端口>/`
-4. `mbCreateWebCustomWindow(WS_POPUP)` 建无边框窗口
-5. 注册 `mbOnJsQuery` 回调、设置 `ncHittestPaddingWidth=6`（边缘拉伸）
+4. `mbCreateWebCustomWindow(WS_POPUP)` 建无边框窗口——**创建时不带 `WS_THICKFRAME`**（原因见下）
+5. 子类化窗口过程后，补上 `WS_THICKFRAME | WS_CAPTION | WS_SYSMENU`（Electron `frame:false` 同款组合）+ `WM_NCCALCSIZE` 把客户区扩成整个窗口；注册 `mbOnJsQuery` 回调
 6. `mbLoadURL("http://127.0.0.1:<port>/")`
 7. `mbRunMessageLoop()`
+
+> **边框样式位的正确打开方式（踩坑实录）**：miniblink 的 webview 渲染视口按窗口
+> **样式**算内边距——创建时若带 `WS_THICKFRAME`，视口从出生就内嵌 ~7px（定位在
+> (7,7)），之后 `mbMoveWindow` / 补发 `WM_SIZE` 都改不回来，四边各露一圈未涂色带，
+> 暗色主题下透出桌面/背后的窗口显白/灰边。正确做法是「创建时不带 `WS_THICKFRAME`
+> → 子类化后补 `WS_THICKFRAME|WS_CAPTION|WS_SYSMENU`」：视口从出生就铺满整个窗口，
+> 同时保住了系统原生边缘缩放、DWM 阴影、最大化撑满与 Win+方向键贴靠。实测只补
+> `WS_THICKFRAME`（无 `CAPTION`）视口仍会内嵌 7px，`CAPTION` 是关键。
+>
+> 另：`mbMoveWindow(view, x, y, w, h)` 的 x/y 是**屏幕坐标**，启动时拿它做
+> 「对齐客户区」会把窗口从居中位置挪到屏幕 (0,0)——无边框创建时视口本就是对的，
+> 不要调。
+>
+> 不留 `ncHittestPaddingWidth` 边缘环：那圈留白会被 miniblink 涂成固定色（顶部白、
+> 左侧黑），暗色主题下露白/黑边。webview 铺满整个窗口，四边颜色完全由页面绘制；
+> 边缘缩放由 `WM_NCHITTEST` 自算命中区（左右下边框各 ~8px + 底部两角，系统原生
+> resize 循环）+ 前端 `ResizeHandle` 把手（8~14px 内缩带）共同完成。
 
 > 为什么不用 `file://` 直接打开 `index.html`：Vite 产物是 `<script type="module">`，
 > 在 `file://` 下会被 CORS 拦掉。走本地 HTTP 就没这个问题，前端还能正常用 `fetch`。
@@ -189,8 +206,8 @@ mbvue-demo\
 └─ uninstall.exe    0.05 MB   卸载器
 ```
 
-> 运行时内核还会在同一目录写出 `LocalStorage\`、`cookies.dat`、`mbvue.window.json`
-> （记住窗口尺寸），卸载时一并删除，不留尾巴。
+> 运行时内核还会在同一目录写出 `LocalStorage\`、`cookies.dat`、`config.json`
+> （记住窗口尺寸等配置），卸载时一并删除，不留尾巴。
 
 三个设计决定：
 
@@ -203,7 +220,8 @@ mbvue-demo\
    `core.dll` 更贴合语义，也便于将来换内核版本时文件名保持稳定。
    开发期 cargo 产物目录里仍是原名，`find_dll()` 两个名字都认，所以改名不影响启动。
 3. **运行时数据落在 exe 同级目录**：`LocalStorage\*.localsto`（界面语种等设置）、
-   `cookies.dat`、磁盘缓存，以及记住窗口尺寸的 `mbvue.window.json`。
+   `cookies.dat`、磁盘缓存，以及 `config.json`（窗口尺寸等配置，放在 `window` 段下，
+   顶层可扩展其它配置项）。
    卸载器会**一并清理**这些运行期产生的文件/目录，做到「卸载即清空、不留尾巴」。
    若装到 `Program Files` 等不可写位置，会自动回退写到 `%LOCALAPPDATA%\mbvue\`
    （同样由卸载器清理），避免写失败静默丢设置。
@@ -250,7 +268,7 @@ python scripts/verify_installer.py     # 安装 → 核对清单 → 启动 → 
 - **卸载前必须杀整棵进程树**。miniblink 内核会派生渲染/GPU 子进程，它们同样持有
   `mb132_x64.dll` 的句柄；只杀宿主 exe 的话文件锁没释放，卸载会删不掉。
 - **卸载会清理全部运行期数据**。内核运行时在 exe 同级写 `cookies.dat` / `LocalStorage\` /
-  `mbvue.window.json`，卸载段已用 `Delete` / `RMDir` 显式清掉；若装到 Program Files
+  `config.json`，卸载段已用 `Delete` / `RMDir` 显式清掉；若装到 Program Files
   不可写而回退到 `%LOCALAPPDATA%\mbvue`（或 UAC VirtualStore 重定向），卸载器也一并
   `RMDir`，无需手动清理。
 

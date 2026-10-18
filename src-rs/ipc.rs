@@ -126,6 +126,30 @@ fn run(cmd: &str, p: &Value) -> Result<Value, String> {
             let cur = crate::i18n::set_locale(get_str(p, "locale", "zh-CN"));
             Ok(json!({ "locale": cur }))
         }
+        // 前端主题生效时同步过来：让壳的兜底背景色（WM_ERASEBKGND）跟着变，
+        // 启动瞬间/缩放过程中 webview 未及时重画时不会闪一下浅色。
+        "app.setTheme" => {
+            let th = get_str(p, "theme", "light");
+            let dark = th == "dark";
+            crate::FRAME_DARK.store(dark, Ordering::Relaxed);
+            // 主题变了但窗口没 resize，兜底背景不会被自动重擦 → 主动失效+擦除。
+            // 只失效父窗口：webview 不受影响、不会重绘，故不闪。
+            with_hwnd(|h| unsafe {
+                windows_sys::Win32::Graphics::Gdi::RedrawWindow(
+                    h,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    0x0001 | 0x0002 | 0x0100, // RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW
+                );
+            })?;
+            Ok(json!({ "theme": th }))
+        }
+
+        // ---------------- 配置（持久化到 config.json）----------------
+        // 前端把界面语种 / 主题这类"跨重启保留"的项落盘到这里，
+        // 顶层键合并写入，保留 window 段（窗口尺寸记忆）等其它配置。
+        "config.get" => Ok(crate::read_config()),
+        "config.set" => Ok(crate::merge_config(p)),
 
         // ---------------- 系统 ----------------
         "sys.info" => sys_info(),

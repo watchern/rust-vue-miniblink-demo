@@ -155,10 +155,50 @@ LangString MUI_LANGDLL_INFO ${LANG_SIMPCHINESE} "请选择安装界面语言。"
 ; [语言文件未定义，NSIS 核心默认英文]
 LangString MUI_LANGDLL_INFO ${LANG_ENGLISH} "Please select the language for the installer."
 
+; [升级安装：检测到目标位置已有实例在运行时的确认文案]
+LangString MSG_RUNNING ${LANG_SIMPCHINESE} "检测到 miniblink + Vue 3 + Rust 演示 正在运行。$\r$\n$\r$\n升级安装需要先关闭它。是否强制关闭并继续安装？$\r$\n（点击「否」将取消安装）"
+LangString MSG_RUNNING ${LANG_ENGLISH} "miniblink + Vue 3 + Rust Demo is currently running.$\r$\n$\r$\nIt must be closed before updating. Force-close it and continue?$\r$\n(Click No to cancel the installation)"
+
+; ---- 升级安装检测 ----
+; 安装前若目标位置已有 mbvue.exe 在运行，提示用户：强制关闭并继续 / 取消安装。
+; 按安装路径精确匹配（不按映像名，避免误杀别的路径下的便携版）。
+; 静默安装（/S）无人可问，直接强制关闭并继续。
+Function .onInit
+  !insertmacro MUI_LANGDLL_DISPLAY
+  Call CheckRunningApp
+FunctionEnd
+
+Function CheckRunningApp
+  ; 用 PowerShell 按路径精确匹配，避免依赖已废弃的 wmic。
+  ; 输出 RUNNING / NONE，再对两个 Pop 结果都判断（ExecToStack 的栈序不敏感）。
+  nsExec::ExecToStack 'powershell -NoProfile -ExecutionPolicy Bypass -Command "$$p=Get-CimInstance Win32_Process -Filter \"Name=''${APP_EXE}''\" | Where-Object ExecutablePath -like ''$INSTDIR*''; if($$p){Write-Output RUNNING}else{Write-Output NONE}"'
+  Pop $0
+  Pop $1
+  ${If} $0 == "RUNNING"
+  ${OrIf} $1 == "RUNNING"
+    ${If} ${Silent}
+      Call KillRunningApp
+    ${Else}
+      MessageBox MB_YESNO|MB_ICONQUESTION "$(MSG_RUNNING)" IDYES doKill IDNO doCancel
+      doKill:
+        Call KillRunningApp
+        Goto done
+      doCancel:
+        Abort
+    ${EndIf}
+  ${EndIf}
+  done:
+FunctionEnd
+
+Function KillRunningApp
+  ; 与卸载段同款逻辑：先 wmic（快），再用 PowerShell+CIM 兜底（通用）。
+  nsExec::ExecToLog 'cmd /c for /f "tokens=2 delims=," %%p in \'wmic process where "name=''${APP_EXE}'' and ExecutablePath like ''$INSTDIR%''" get processid /value\' do taskkill /F /T /PID %%p'
+  nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -Command "$$p = Get-CimInstance Win32_Process -Filter \"Name=''${APP_EXE}''\" | Where-Object ExecutablePath -like ''$INSTDIR*''; if ($$p) { $$p | ForEach-Object { Invoke-CimMethod -InputObject $$_ -MethodName Terminate | Out-Null } }"'
+FunctionEnd
+
 Section "mbvue" SecMain
   SectionIn RO
   SetOutPath "$INSTDIR"
-
   ; ---- 全部内容就 3 个文件 ----
   File "${SRC_RELEASE}\${APP_EXE}"
   ; 唯一的内核 DLL。x64 进程在 Windows 上无法加载 x32 DLL，
@@ -215,7 +255,9 @@ Section "Uninstall"
   ;      装到 Program Files 不可写时会回退到 %LOCALAPPDATA%\mbvue，见下方清理）----
   ; cookies.dat：cookie 存储
   Delete "$INSTDIR\cookies.dat"
-  ; mbvue.window.json：记住的窗口尺寸/位置
+  ; config.json：窗口尺寸（window 段）及其它配置项
+  Delete "$INSTDIR\config.json"
+  ; 兼容旧版：记得窗口尺寸的 mbvue.window.json（扁平格式，已迁移到 config.json）
   Delete "$INSTDIR\mbvue.window.json"
   ; LocalStorage\：DOM storage 落盘目录（界面语种偏好等）
   RMDir /r "$INSTDIR\LocalStorage"

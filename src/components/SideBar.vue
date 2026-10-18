@@ -20,6 +20,7 @@ const items: NavItem[] = [
   { id: 'system', icon: 'cpu' },
   { id: 'files', icon: 'folder' },
   { id: 'bridge', icon: 'swap' },
+  { id: 'settings', icon: 'gear' },
   { id: 'about', icon: 'info' },
 ]
 
@@ -51,6 +52,10 @@ const statusText = computed(() => t(nativeState.ok ? 'status.connected' : 'statu
           </template>
           <template v-else-if="it.icon === 'swap'">
             <path d="M4.5 8.5h13l-3-3M19.5 15.5h-13l3 3" />
+          </template>
+          <template v-else-if="it.icon === 'gear'">
+            <path d="M19.14 12.94a7.5 7.5 0 0 0 .05-1.88l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.3 7.3 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54c-.58.24-1.12.55-1.62.94l-2.39-.96a.5.5 0 0 0-.6.22L2.74 8.84a.5.5 0 0 0 .12.64l2.03 1.58a7.5 7.5 0 0 0 0 1.88l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32a.5.5 0 0 0 .6.22l2.39-.96c.5.39 1.04.7 1.62.94l.36 2.54a.5.5 0 0 0 .5.42h3.84a.5.5 0 0 0 .5-.42l.36-2.54c.58-.24 1.12-.55 1.62-.94l2.39.96a.5.5 0 0 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58z" />
+            <circle cx="12" cy="12" r="3" />
           </template>
           <template v-else>
             <circle cx="12" cy="12" r="8.2" />
@@ -110,7 +115,7 @@ const statusText = computed(() => t(nativeState.ok ? 'status.connected' : 'statu
 }
 
 .nav-item:hover {
-  background: #eceff4;
+  background: var(--hover-bg);
   color: var(--text);
 }
 
@@ -145,7 +150,7 @@ const statusText = computed(() => t(nativeState.ok ? 'status.connected' : 'statu
   padding: 5px 8px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  background: #fff;
+  background: var(--panel);
   color: var(--text-2);
   font-size: 11.5px;
   transition: background .13s, border-color .13s;

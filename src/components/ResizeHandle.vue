@@ -8,18 +8,20 @@ import { bridge } from '../bridge'
 // 实测机制（2026-10 于本机 1366x768 / DPI 100% 环境，SetWinEventHook 间谍 +
 // 逐轮询日志三方对照验证，结论同时适用于 Node/koffi 与 Rust 两套宿主）：
 //
-//   第一层｜系统原生 resize 循环（窗口外 0~4px，即 WS_THICKFRAME 边框区）
-//     WS_THICKFRAME 已保留；WM_NCHITTEST 返回 HTRIGHT/HTBOTTOM 等后，
-//     miniblink 的 WndProc 把非 HTCAPTION 的 WM_NCLBUTTONDOWN 透传给
-//     DefWindowProc → 原生 resize 模态循环启动（间谍实测
+//   第一层｜系统原生 resize 循环（壳的 WM_NCHITTEST 自算命中区：左右下边框
+//     各 ~8px + 底部两角）——命中后 WM_NCLBUTTONDOWN 被 miniblink 透传给
+//     DefWindowProc，原生 resize 模态循环启动（间谍实测
 //     EVENT_SYSTEM_MOVESIZESTART/END，窗口尺寸精确跟随鼠标）。
 //     边界：仅在窗口处于前台/激活态时生效；非激活态该区域 mousedown 被
 //     系统用于激活窗口，循环不启动。
 //
-//   第二层｜本组件的前端 handle（客户区外 6px ≈ 窗口内 4~10px）
+//   第二层｜本组件的前端 handle（系统命中带再往里 6px）
 //     webview 收到 mousedown → win.getSize 读基准 → mousemove 按增量算目标
 //     尺寸 → win.resize 下发 SetWindowPos(SWP_NOMOVE)（左上角不动）。
-//     与前台状态无关，恒可工作，和第一层互补覆盖整个 ~10px 缩放带。
+//     与前台状态无关，恒可工作，和第一层互补覆盖整个 ~14px 缩放带。
+//     把手统一从边缘内缩 8px：壳把顶部整条留给标题栏（拖拽+窗口按钮都
+//     在 webview 里），系统命中带也只覆盖左右下——内缩后把手正好贴着
+//     系统命中带内侧，不重叠、不留死角。
 //
 //   第三层｜最小尺寸钳制：Node 版 TIMERPROC 300ms 轮询守卫，Rust 版
 //     WM_GETMINMAXINFO 原生子类化；前端再钳一次做双保险。
@@ -104,8 +106,8 @@ onUnmounted(endDrag)
 }
 
 .rz-e {
-  top: 46px; /* 标题栏高度，让标题栏拖拽区保持完整 */
-  right: 0;
+  top: 30px; /* 标题栏高度（用户已调至 30px），让标题栏拖拽区保持完整 */
+  right: 8px; /* 内缩避开壳的 WM_NCHITTEST 系统命中带（~8px） */
   bottom: 16px;
   width: 6px;
   cursor: ew-resize;
@@ -114,14 +116,14 @@ onUnmounted(endDrag)
 .rz-s {
   left: 16px;
   right: 16px;
-  bottom: 0;
+  bottom: 8px; /* 同上：内缩避开系统命中带 */
   height: 6px;
   cursor: ns-resize;
 }
 
 .rz-se {
-  right: 0;
-  bottom: 0;
+  right: 8px; /* 同上：内缩避开系统命中带 */
+  bottom: 8px;
   width: 16px;
   height: 16px;
   display: grid;

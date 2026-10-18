@@ -99,6 +99,9 @@ VIAddVersionKey /LANG=1033 "CompanyName"     "${APP_PUBLISHER}"
 ; MUI_PAGE_INIT 里 `!ifdef MUI_INSERT → warning`，而 MUI_INSERT 是在第一次
 ; MUI_LANGUAGE 时才定义的。所以官方推荐顺序是「页面 → 语言」，反了会一直告警。
 !insertmacro MUI_PAGE_WELCOME
+; 目录页「下一步」时检查目标位置是否已有实例在跑（该函数用最终选定的 $INSTDIR 判定）。
+; MUI 的自定义回调 define 必须写在对应页面宏**之前**才生效。
+!define MUI_PAGE_CUSTOMFUNCTION_LEAVE DirPageLeave
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
@@ -156,44 +159,101 @@ LangString MUI_LANGDLL_INFO ${LANG_SIMPCHINESE} "请选择安装界面语言。"
 LangString MUI_LANGDLL_INFO ${LANG_ENGLISH} "Please select the language for the installer."
 
 ; [升级安装：检测到目标位置已有实例在运行时的确认文案]
-LangString MSG_RUNNING ${LANG_SIMPCHINESE} "检测到 miniblink + Vue 3 + Rust 演示 正在运行。$\r$\n$\r$\n升级安装需要先关闭它。是否强制关闭并继续安装？$\r$\n（点击「否」将取消安装）"
-LangString MSG_RUNNING ${LANG_ENGLISH} "miniblink + Vue 3 + Rust Demo is currently running.$\r$\n$\r$\nIt must be closed before updating. Force-close it and continue?$\r$\n(Click No to cancel the installation)"
+LangString MSG_RUNNING ${LANG_SIMPCHINESE} "检测到 ${APP_NAME_CN} 正在运行。$\r$\n$\r$\n安装需要先关闭它。是否立即关闭并继续安装？$\r$\n（选择「否」将留在当前页面，你可以更换安装位置或取消安装）"
+LangString MSG_RUNNING ${LANG_ENGLISH} "${APP_NAME} is currently running.$\r$\n$\r$\nIt must be closed before installing. Close it now and continue?$\r$\n(Choosing No returns you to the previous page, where you can pick another location or cancel)"
 
-; ---- 升级安装检测 ----
-; 安装前若目标位置已有 mbvue.exe 在运行，提示用户：强制关闭并继续 / 取消安装。
-; 按安装路径精确匹配（不按映像名，避免误杀别的路径下的便携版）。
-; 静默安装（/S）无人可问，直接强制关闭并继续。
-Function .onInit
-  !insertmacro MUI_LANGDLL_DISPLAY
-  Call CheckRunningApp
-FunctionEnd
+; [升级安装：杀进程失败时的提示]
+LangString MSG_STILL_RUNNING ${LANG_SIMPCHINESE} "仍有 ${APP_EXE} 进程未退出，安装无法继续。$\r$\n$\r$\n请手动关闭应用（右键托盘图标 → 退出）后重试。"
+LangString MSG_STILL_RUNNING ${LANG_ENGLISH} "Some ${APP_EXE} processes could not be terminated, so the setup cannot continue.$\r$\n$\r$\nPlease close the app manually (right-click the tray icon and choose Exit), then try again."
+
+; ---- 升级安装：目标位置已有实例在跑时的处理 ----
+;
+; 历史 bug（勿再回头）：PowerShell 命令原本直接写在 nsExec 的命令行里，会被**两层**吃掉：
+;   ① NSIS 单引号字符串里写 '' —— 它被当成「字符串结束 + 新字符串开始」（相邻字符串会自动
+;      拼接），单引号直接丢失，WQL 变成 `Name=mbvue.exe` → “无效查询”；
+;   ② \" 在 NSIS 里**不是**转义（NSIS 的引号转义是 $\"），PowerShell 收到带反斜杠的引号后
+;      直接报 TerminatorExpectedAtEndOfString。
+; 于是检测永远返回「没在跑」，安装到一半撞上文件锁，弹出 NSIS 自带的
+; 「无法打开要写入的文件 / 中止·重试·取消」—— 只有三个按钮且看不懂，体验很差。
+;
+; 正确做法（本文件现在的实现）：
+;   · 把脚本写成 $TEMP 下的 .ps1，用 `powershell -File` 执行 —— 完全绕开命令行引号问题；
+;   · 用**退出码**判读（1=在跑 / 0=没在跑），不用 stdout —— 避免尾随换行让字符串比较失败；
+;   · 按 $INSTDIR 精确匹配（不按映像名），不会误伤别处的便携版；
+;   · 连子进程一起终止（miniblink 会派生渲染/GPU 子进程且它们同样持有 core.dll 句柄）。
+Var IsRunning
 
 Function CheckRunningApp
-  ; 用 PowerShell 按路径精确匹配，避免依赖已废弃的 wmic。
-  ; 输出 RUNNING / NONE，再对两个 Pop 结果都判断（ExecToStack 的栈序不敏感）。
-  nsExec::ExecToStack 'powershell -NoProfile -ExecutionPolicy Bypass -Command "$$p=Get-CimInstance Win32_Process -Filter \"Name=''${APP_EXE}''\" | Where-Object ExecutablePath -like ''$INSTDIR*''; if($$p){Write-Output RUNNING}else{Write-Output NONE}"'
+  ; 生成检测脚本（FTP 式写文件，`$\"` 是 NSIS 的引号转义，`$$` 是字面 $）
+  FileOpen $0 "$TEMP\mbvue_check.ps1" w
+  FileWriteUTF16LE /BOM $0 "$$targets = Get-CimInstance Win32_Process -Filter $\"Name='${APP_EXE}'$\" | Where-Object { $$_.ExecutablePath -like '$INSTDIR*' }$\r$\n"
+  FileWriteUTF16LE $0 "if ($$targets) { exit 1 } else { exit 0 }$\r$\n"
+  FileClose $0
+  nsExec::ExecToStack 'powershell -NoProfile -ExecutionPolicy Bypass -File "$TEMP\mbvue_check.ps1"'
   Pop $0
-  Pop $1
-  ${If} $0 == "RUNNING"
-  ${OrIf} $1 == "RUNNING"
-    ${If} ${Silent}
-      Call KillRunningApp
-    ${Else}
-      MessageBox MB_YESNO|MB_ICONQUESTION "$(MSG_RUNNING)" IDYES doKill IDNO doCancel
-      doKill:
-        Call KillRunningApp
-        Goto done
-      doCancel:
-        Abort
-    ${EndIf}
+  Delete "$TEMP\mbvue_check.ps1"
+  StrCpy $IsRunning "0"
+  ${If} $0 == "1"
+    StrCpy $IsRunning "1"
   ${EndIf}
-  done:
 FunctionEnd
 
-Function KillRunningApp
-  ; 与卸载段同款逻辑：先 wmic（快），再用 PowerShell+CIM 兜底（通用）。
-  nsExec::ExecToLog 'cmd /c for /f "tokens=2 delims=," %%p in \'wmic process where "name=''${APP_EXE}'' and ExecutablePath like ''$INSTDIR%''" get processid /value\' do taskkill /F /T /PID %%p'
-  nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -Command "$$p = Get-CimInstance Win32_Process -Filter \"Name=''${APP_EXE}''\" | Where-Object ExecutablePath -like ''$INSTDIR*''; if ($$p) { $$p | ForEach-Object { Invoke-CimMethod -InputObject $$_ -MethodName Terminate | Out-Null } }"'
+; 安装侧与卸载侧共用同一份实现。函数体写成宏再实例化两次，是因为
+; NSIS 规定「卸载段里 Call 的函数名必须以 un. 开头」—— 否则编译期直接报
+; `Call must be used with function names starting with "un."`。
+!macro MK_KILL_RUNNING_APP prefix
+  Function ${prefix}KillRunningApp
+    FileOpen $0 "$TEMP\mbvue_kill.ps1" w
+    FileWriteUTF16LE /BOM $0 "$$targets = Get-CimInstance Win32_Process -Filter $\"Name='${APP_EXE}'$\" | Where-Object { $$_.ExecutablePath -like '$INSTDIR*' }$\r$\n"
+    FileWriteUTF16LE $0 "if ($$targets) {$\r$\n"
+    FileWriteUTF16LE $0 "  $$ids = $$targets | ForEach-Object { $$_.ProcessId }$\r$\n"
+    FileWriteUTF16LE $0 "  $$children = Get-CimInstance Win32_Process | Where-Object { $$ids -contains $$_.ParentProcessId }$\r$\n"
+    FileWriteUTF16LE $0 "  $$targets  | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force -ErrorAction SilentlyContinue }$\r$\n"
+    FileWriteUTF16LE $0 "  $$children | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force -ErrorAction SilentlyContinue }$\r$\n"
+    FileWriteUTF16LE $0 "}$\r$\n"
+    FileWriteUTF16LE $0 "exit 0$\r$\n"
+    FileClose $0
+    nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$TEMP\mbvue_kill.ps1"'
+    Delete "$TEMP\mbvue_kill.ps1"
+  FunctionEnd
+!macroend
+
+!insertmacro MK_KILL_RUNNING_APP ""      ; → KillRunningApp（安装侧）
+!insertmacro MK_KILL_RUNNING_APP "un."   ; → un.KillRunningApp（卸载侧）
+
+; 目录页离开时检查：用的是用户**最终选定**的 $INSTDIR，而不是 .onInit 时注册表里的默认值，
+; 所以判定永远针对真正要写入的位置（用户在目录页换了地方也不会漏判）。
+Function DirPageLeave
+  Call CheckRunningApp
+  ${If} $IsRunning == "1"
+    MessageBox MB_YESNO|MB_ICONQUESTION "$(MSG_RUNNING)" IDYES killNow IDNO stayHere
+    killNow:
+      Call KillRunningApp
+      ; 句柄释放有时延，杀完复核一次，确认真的没了再继续
+      Sleep 1500
+      Call CheckRunningApp
+      ${If} $IsRunning == "1"
+        MessageBox MB_OK|MB_ICONEXCLAMATION "$(MSG_STILL_RUNNING)"
+        Abort
+      ${EndIf}
+      Goto checked
+    stayHere:
+      Abort            ; 留在目录页，可更换位置或取消安装
+    checked:
+  ${EndIf}
+FunctionEnd
+
+Function .onInit
+  !insertmacro MUI_LANGDLL_DISPLAY
+  ; 静默安装（/S）不走任何页面，DirPageLeave 不会触发，这里兜底：
+  ; 发现占用直接强杀后继续（无人可答）。
+  ${If} ${Silent}
+    Call CheckRunningApp
+    ${If} $IsRunning == "1"
+      Call KillRunningApp
+      Sleep 1500
+    ${EndIf}
+  ${EndIf}
 FunctionEnd
 
 Section "mbvue" SecMain
@@ -233,20 +293,12 @@ SectionEnd
 
 Section "Uninstall"
   ; 先关掉正在运行的实例，否则 exe 与内核 DLL 被占用删不掉。
-  ; 用「按安装路径精确匹配」而不是 `taskkill /IM mbvue.exe`：/IM 按映像名匹配，
-  ; 会把用户另外在跑的便携版（build_target\install\mbvue.exe）一起杀掉，
-  ; 那是用户的东西，卸载器不该替用户做这个决定。
-  ;
-  ; 两道保险：
-  ;   ① wmic —— 快，但 Win11 24H2 起已废弃，可能不存在；
-  ;   ② PowerShell + CIM —— 慢但通用，兜底。
-  ; 两条都刻意写成不用 $_（NSIS 会把 $_ 当成自己的变量而报 warning 6000），
-  ; 改用 Invoke-CimMethod -MethodName Terminate 直接按对象终止。
-  ;
-  ; /T 的等价能力由 Terminate 覆盖不到子进程，这里靠 kernel32 层面的
-  ; 进程树由 PowerShell 补：先杀父，miniblink 派生的渲染/GPU 子进程会随之退出。
-  nsExec::ExecToLog 'cmd /c for /f "tokens=2 delims=," %%p in \'wmic process where "name=''${APP_EXE}'' and ExecutablePath like ''$INSTDIR%''" get processid /value\' do taskkill /F /T /PID %%p'
-  nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -Command "$$p = Get-CimInstance Win32_Process -Filter \"Name=''${APP_EXE}''\" | Where-Object ExecutablePath -like ''$INSTDIR*''; if ($$p) { $$p | ForEach-Object { Invoke-CimMethod -InputObject $$_ -MethodName Terminate | Out-Null } }"'
+  ; 与安装侧共用同一个 KillRunningApp：$TEMP 下写 .ps1 + powershell -File，
+  ; 按 $INSTDIR 精确匹配（不按映像名，避免误杀用户另外在跑的便携版），并连子进程一起终止。
+  ; （原先那两行是 wmic + 命令行 PowerShell —— 引号被 NSIS 两层吃掉，实际从未生效；
+  ;   wmic 也已在 Win11 24H2 起被移除，统一走 PowerShell。）
+  Call un.KillRunningApp
+  Sleep 1500
 
   Delete "$INSTDIR\${APP_EXE}"
   Delete "$INSTDIR\mb132_x64.dll"

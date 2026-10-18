@@ -226,6 +226,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--skip-install', action='store_true')
     ap.add_argument('--skip-launch', action='store_true')
+    ap.add_argument('--skip-upgrade', action='store_true',
+                    help='跳过「应用运行中升级安装」这一步')
     ap.add_argument('--skip-uninstall', action='store_true')
     ap.add_argument('--timeout', type=int, default=45, help='等窗口出现的秒数')
     ap.add_argument('--uninstall-timeout', type=int, default=40,
@@ -371,9 +373,80 @@ def main() -> int:
                 for line in tail:
                     print('    ' + line)
 
-    # ---------------------------------------------------------------- 3. 卸载
+    # ------------------------------------------------- 3. 占用态升级安装（回归) ──
+    # 这一条是用来守住「应用正在运行时不能重新安装」的老 bug 的：
+    # 早期版本没做运行检测（后来写的检测因 NSIS/PowerShell 引号两层丢失而从未生效），
+    # 安装到一半撞上文件锁，弹出 NSIS 自带的「无法打开要写入的文件 / 中止·重试·取消」，
+    # 用户除了这三个按钮别无选择。现在的安装器应当自己检测并关掉旧进程后装完。
+    # 判据很硬：装完退出码必须是 0，且不允许卡住（subprocess.run 有 timeout）——
+    # 一旦退回旧行为，安装器会停在对话框里等人工点击，这里必然超时。
+    if not args.skip_upgrade:
+        print('\n[3] 应用运行中执行升级安装…')
+        exe3 = INSTALL_ROOT / EXE_NAME
+        env3 = dict(os.environ)
+        env3.pop('ELECTRON_RUN_AS_NODE', None)
+        logf3 = open(ROOT / 'logs' / 'verify-installer-upgrade.log', 'w',
+                     encoding='utf-8', errors='replace')
+        occupant = subprocess.Popen([str(exe3)], cwd=str(INSTALL_ROOT),
+                                    stdout=logf3, stderr=subprocess.STDOUT, env=env3)
+        try:
+            # 等窗口真的出现——进程在 ≠ 已经拿到 exe/core.dll 的锁，太早点会假阴性
+            t0 = time.time()
+            got = False
+            while time.time() - t0 < args.timeout:
+                if occupant.poll() is not None:
+                    break
+                if find_window(None, str(exe3)):
+                    got = True
+                    break
+                time.sleep(0.5)
+            if not got:
+                ok = False
+                print(f'    FAIL: 占用进程未能启动（{args.timeout}s 内无窗口）')
+            else:
+                time.sleep(2.0)
+                print(f'    应用已在运行 pid={occupant.pid}（正占用 exe 与 core.dll）')
+                try:
+                    r = subprocess.run([str(SETUP), '/S', f'/D={INSTALL_ROOT}'],
+                                       capture_output=True, encoding='utf-8',
+                                       errors='replace', timeout=180)
+                    rc = r.returncode
+                except subprocess.TimeoutExpired:
+                    # 这正是老 bug 的表现：安装器卡在「无法打开要写入的文件 / 中止·重试·
+                    # 取消」对话框里等人点按钮。subprocess.run 超时会顺手把安装器杀掉。
+                    ok = False
+                    print('    FAIL: 180s 未装完 —— 安装器大概率卡在文件锁对话框上')
+                    print('          （旧版缺陷回放：未检测到运行中的实例就往里写文件）')
+                print(f'    安装器退出码 {rc}')
+                if rc != 0:
+                    ok = False
+                    print(f'    FAIL: 占用态安装未成功，stderr={r.stderr[:200]!r}')
+                # 安装器应当已经把旧进程关掉
+                gone = False
+                t1 = time.time()
+                while time.time() - t1 < 15:
+                    if occupant.poll() is not None:
+                        gone = True
+                        break
+                    time.sleep(0.5)
+                if gone:
+                    print(f'    [OK] 旧进程已被自动关闭（pid={occupant.pid} 已退出）')
+                else:
+                    ok = False
+                    print(f'    FAIL: 安装后旧进程仍在运行 pid={occupant.pid}')
+        finally:
+            if occupant.poll() is None:
+                kill_by_exe(str(exe3))
+                kill_tree(occupant.pid)
+                try:
+                    occupant.wait(10)
+                except subprocess.TimeoutExpired:
+                    occupant.kill()
+            logf3.close()
+
+    # ---------------------------------------------------------------- 4. 卸载
     if not args.skip_uninstall:
-        print('\n[3] 静默卸载…')
+        print('\n[4] 静默卸载…')
         uninst = INSTALL_ROOT / 'uninstall.exe'
         if uninst.exists():
             r = subprocess.run([str(uninst), '/S'], capture_output=True,

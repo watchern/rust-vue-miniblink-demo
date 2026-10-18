@@ -95,6 +95,34 @@ npm run dev    # 浏览器打开 http://127.0.0.1:5173
 > `NOTREACHED hit. Tried to RegisterCallback without an AtExitManager` FATAL，
 > 因此没有调用（mb132 默认已处理高 DPI）。
 
+### 暗色主题四边白边：排查过程
+
+用户报「切暗色后顶部一行白色」，细看是**上/下/右三边**（左边未暴露）。完整排查过程：
+
+1. **排除前端**：先查 `style.css` 的暗色变量覆盖与 TitleBar/SideBar 的硬编码颜色——
+   边条位于 webview 绘制区之外，属于窗口边框区域根本没被绘制，与 CSS 无关。
+2. **矩阵实验**：在 `main.rs` 里加环境变量开关（`MB_FRAME` 等），一次编译对比多种窗口
+   创建方式，同时用屏幕级 BitBlt 采样四边像素——「创建时带 `WS_THICKFRAME`」稳定复现。
+3. **根因**：miniblink 的 webview 视口内边距**按窗口 STYLE 计算，不按实际 client rect**
+   （见上方踩坑实录）。创建时带 `WS_THICKFRAME` → 视口天生 (7,7) inset，四周 7px 不涂色，
+   暗色主题下露出内核自绘的浅色底 (244,247,252)，即用户看到的白边。
+4. **关键试错**：改为子类化后只补 `WS_THICKFRAME`（无 CAPTION）→ 仍是 7px inset、白边照旧；
+   补上 `WS_CAPTION` 视口才填满——**CAPTION 是关键位，不是 THICKFRAME**。
+5. **最终方案**：创建时不带 `WS_THICKFRAME`（诞生即满）→ 子类化后补
+   `WS_THICKFRAME | WS_CAPTION | WS_SYSMENU` + `SetWindowPos(SWP_FRAMECHANGED)`，
+   即上方启动步骤 4/5 的写法。
+6. **验证**：预置 `config.json` 暗色主题启动，四边像素采样**白色占比 0%**
+   （均值如 top (28,31,38)、bottom (22,24,30)、left (34,37,45)、right (46,54,69)）；
+   原生边缘缩放、最大化/还原、三个窗口按钮、托盘全部回归通过；`cargo test` 10/10。
+
+排查中的附带发现（均已写进代码注释）：
+
+- `mbMoveWindow(view, x, y, w, h)` 的 x/y 是**屏幕坐标**，启动时拿它「对齐客户区」会把
+  窗口从居中位置挪到屏幕 (0,0)——新架构下根本不需要调，已删除；
+- `mbRunJs` 不能在 worker 线程调（段错误），JS 视口探针方案废弃，改用像素采样验证；
+- 本机 `SM_CYPADDEDBORDER`(93) 返回垃圾值 648，`WM_NCHITTEST` 两个轴都必须用
+  `SM_CXPADDEDBORDER`(92)。
+
 ---
 
 ## 双向通信

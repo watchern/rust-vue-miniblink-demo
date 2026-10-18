@@ -28,6 +28,7 @@ SetCompressor /SOLID lzma
 !define APP_NAME_CN   "miniblink + Vue 3 + Rust 演示"
 !define APP_PUBLISHER "workbuddy-demo"
 !define APP_EXE       "mbvue.exe"
+!define APP_PROC      "mbvue"   ; 不带后缀的进程名（Get-Process -Name 用这个）
 !define APP_VERSION   "0.1.0"
 !define APP_REGKEY    "Software\workbuddy-demo\mbvue"
 
@@ -178,61 +179,122 @@ LangString MSG_STILL_RUNNING ${LANG_ENGLISH} "Some ${APP_EXE} processes could no
 ;
 ; 正确做法（本文件现在的实现）：
 ;   · 把脚本写成 $TEMP 下的 .ps1，用 `powershell -File` 执行 —— 完全绕开命令行引号问题；
-;   · 用**退出码**判读（1=在跑 / 0=没在跑），不用 stdout —— 避免尾随换行让字符串比较失败；
+;   · 结果用**哨兵文件**传递（`.done` 表示跑完 / `.flag` 表示「在跑」），
+;     不用 stdout 也不用退出码 —— 这样后台异步跑完也能取到结果；
 ;   · 按 $INSTDIR 精确匹配（不按映像名），不会误伤别处的便携版；
 ;   · 连子进程一起终止（miniblink 会派生渲染/GPU 子进程且它们同样持有 core.dll 句柄）。
+;
+; 体验上的关键设计：**检测提前到安装程序启动时就后台开跑**。
+; 早期版本是在目录页点「下一步」时才同步跑 PowerShell（CIM 查询 1~3 秒），
+; 用户会明显感到「点了没反应、卡一下才弹提示」。现在改成：
+;   .onInit       → 后台异步启动检测（隐藏窗口，不阻塞任何界面）
+;   DirPageLeave  → 直接取结果；目录被改过或后台还没跑完才退化为同步检测
+; 于是绝大多数情况下（沿用注册表里那个安装位置）点「下一步」是**瞬时**响应。
 Var IsRunning
+Var PrefetchDir     ; 后台预检时用的 $INSTDIR，用来判断缓存结果是否还有效
+Var KillOk          ; 0=进程已清空 / 1=仍有残留
+Var v1
 
-Function CheckRunningApp
-  ; 生成检测脚本（FTP 式写文件，`$\"` 是 NSIS 的引号转义，`$$` 是字面 $）
+; 生成检测脚本。注意 NSIS 里 `$\"` 才是引号转义，`$$` 是字面 $。
+Function WriteCheckScript
   FileOpen $0 "$TEMP\mbvue_check.ps1" w
-  FileWriteUTF16LE /BOM $0 "$$targets = Get-CimInstance Win32_Process -Filter $\"Name='${APP_EXE}'$\" | Where-Object { $$_.ExecutablePath -like '$INSTDIR*' }$\r$\n"
-  FileWriteUTF16LE $0 "if ($$targets) { exit 1 } else { exit 0 }$\r$\n"
+  FileWriteUTF16LE /BOM $0 "$$runFlag = $\"$$env:TEMP\mbvue_running.flag$\"$\r$\n"
+  FileWriteUTF16LE $0 "$$doneFlag = $\"$$env:TEMP\mbvue_running.done$\"$\r$\n"
+  FileWriteUTF16LE $0 "Remove-Item $$runFlag,$$doneFlag -Force -ErrorAction SilentlyContinue$\r$\n"
+  ; 快速通道：连同名进程都没有时立刻返回，省掉一次 CIM 全量枚举（全新安装走这条）
+  FileWriteUTF16LE $0 "$$p = Get-Process -Name '${APP_PROC}' -ErrorAction SilentlyContinue$\r$\n"
+  FileWriteUTF16LE $0 "if ($$p) {$\r$\n"
+  FileWriteUTF16LE $0 "  $$t = Get-CimInstance Win32_Process -Filter $\"Name='${APP_EXE}'$\" | Where-Object { $$_.ExecutablePath -like '$INSTDIR*' }$\r$\n"
+  FileWriteUTF16LE $0 "  if ($$t) { New-Item -ItemType File -Path $$runFlag -Force | Out-Null }$\r$\n"
+  FileWriteUTF16LE $0 "}$\r$\n"
+  FileWriteUTF16LE $0 "New-Item -ItemType File -Path $$doneFlag -Force | Out-Null$\r$\n"
+  FileWriteUTF16LE $0 "exit 0$\r$\n"
   FileClose $0
+FunctionEnd
+
+; 同步跑一次检测（用于：静默安装、用户在目录页改了位置、后台预检没赶上）
+Function RunCheckSync
+  Call WriteCheckScript
   nsExec::ExecToStack 'powershell -NoProfile -ExecutionPolicy Bypass -File "$TEMP\mbvue_check.ps1"'
   Pop $0
-  Delete "$TEMP\mbvue_check.ps1"
+  Call ReadCheckResult
+FunctionEnd
+
+; 从哨兵文件读结果 → $IsRunning
+Function ReadCheckResult
   StrCpy $IsRunning "0"
-  ${If} $0 == "1"
+  IfFileExists "$TEMP\mbvue_running.flag" setRunning done
+  setRunning:
     StrCpy $IsRunning "1"
-  ${EndIf}
+  done:
 FunctionEnd
 
 ; 安装侧与卸载侧共用同一份实现。函数体写成宏再实例化两次，是因为
 ; NSIS 规定「卸载段里 Call 的函数名必须以 un. 开头」—— 否则编译期直接报
 ; `Call must be used with function names starting with "un."`。
+; 「关掉 + 等它真的退出」放在同一次 PowerShell 调用里完成：
+; 句柄释放有时延，以前是 NSIS 侧 Sleep 1.5s 再查一次，等于用户要多等两轮 PowerShell 启动；
+; 现在脚本内部轮询（最多 8s），退出码 0=已清空 / 1=仍有残留。
 !macro MK_KILL_RUNNING_APP prefix
   Function ${prefix}KillRunningApp
     FileOpen $0 "$TEMP\mbvue_kill.ps1" w
     FileWriteUTF16LE /BOM $0 "$$targets = Get-CimInstance Win32_Process -Filter $\"Name='${APP_EXE}'$\" | Where-Object { $$_.ExecutablePath -like '$INSTDIR*' }$\r$\n"
-    FileWriteUTF16LE $0 "if ($$targets) {$\r$\n"
-    FileWriteUTF16LE $0 "  $$ids = $$targets | ForEach-Object { $$_.ProcessId }$\r$\n"
-    FileWriteUTF16LE $0 "  $$children = Get-CimInstance Win32_Process | Where-Object { $$ids -contains $$_.ParentProcessId }$\r$\n"
-    FileWriteUTF16LE $0 "  $$targets  | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force -ErrorAction SilentlyContinue }$\r$\n"
-    FileWriteUTF16LE $0 "  $$children | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force -ErrorAction SilentlyContinue }$\r$\n"
+    FileWriteUTF16LE $0 "if (-not $$targets) { exit 0 }$\r$\n"
+    FileWriteUTF16LE $0 "$$ids = $$targets | ForEach-Object { $$_.ProcessId }$\r$\n"
+    FileWriteUTF16LE $0 "$$children = Get-CimInstance Win32_Process | Where-Object { $$ids -contains $$_.ParentProcessId }$\r$\n"
+    FileWriteUTF16LE $0 "$$targets  | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force -ErrorAction SilentlyContinue }$\r$\n"
+    FileWriteUTF16LE $0 "$$children | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force -ErrorAction SilentlyContinue }$\r$\n"
+    FileWriteUTF16LE $0 "$$deadline = (Get-Date).AddSeconds(8)$\r$\n"
+    FileWriteUTF16LE $0 "while ((Get-Date) -lt $$deadline) {$\r$\n"
+    FileWriteUTF16LE $0 "  $$left = Get-CimInstance Win32_Process -Filter $\"Name='${APP_EXE}'$\" | Where-Object { $$_.ExecutablePath -like '$INSTDIR*' }$\r$\n"
+    FileWriteUTF16LE $0 "  if (-not $$left) { exit 0 }$\r$\n"
+    FileWriteUTF16LE $0 "  Start-Sleep -Milliseconds 300$\r$\n"
     FileWriteUTF16LE $0 "}$\r$\n"
-    FileWriteUTF16LE $0 "exit 0$\r$\n"
+    FileWriteUTF16LE $0 "exit 1$\r$\n"
     FileClose $0
     nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$TEMP\mbvue_kill.ps1"'
+    Pop $0
     Delete "$TEMP\mbvue_kill.ps1"
+    StrCpy $KillOk "0"
+    ${If} $0 != "0"
+      StrCpy $KillOk "1"
+    ${EndIf}
   FunctionEnd
 !macroend
 
 !insertmacro MK_KILL_RUNNING_APP ""      ; → KillRunningApp（安装侧）
 !insertmacro MK_KILL_RUNNING_APP "un."   ; → un.KillRunningApp（卸载侧）
 
-; 目录页离开时检查：用的是用户**最终选定**的 $INSTDIR，而不是 .onInit 时注册表里的默认值，
-; 所以判定永远针对真正要写入的位置（用户在目录页换了地方也不会漏判）。
+; 目录页「下一步」：判定用的是用户**最终选定**的 $INSTDIR。
+; 结果的三种来源，优先级从快到慢：
+;   ① 目录没被改过 → 直接用启动时后台预检的哨兵文件（通常早就跑完了，瞬时）
+;   ② 后台还没跑完（用户手速太快）→ 轮询等一下，最多 ~5s
+;   ③ 目录被改过 / 后台异常 → 用新位置同步检测一次（退化路径，正确性优先）
 Function DirPageLeave
-  Call CheckRunningApp
+  StrCmp $INSTDIR $PrefetchDir prefetch checkAgain
+
+prefetch:
+  StrCpy $v1 0
+waitLoop:
+  IfFileExists "$TEMP\mbvue_running.done" haveResult 0
+  Sleep 200
+  IntOp $v1 $v1 + 1
+  IntCmp $v1 25 syncFallback waitLoop syncFallback   ; 25×200ms ≈ 5s
+haveResult:
+  Call ReadCheckResult
+  Goto handle
+syncFallback:
+  Call RunCheckSync
+  Goto handle
+checkAgain:
+  Call RunCheckSync
+
+handle:
   ${If} $IsRunning == "1"
     MessageBox MB_YESNO|MB_ICONQUESTION "$(MSG_RUNNING)" IDYES killNow IDNO stayHere
     killNow:
       Call KillRunningApp
-      ; 句柄释放有时延，杀完复核一次，确认真的没了再继续
-      Sleep 1500
-      Call CheckRunningApp
-      ${If} $IsRunning == "1"
+      ${If} $KillOk != "0"
         MessageBox MB_OK|MB_ICONEXCLAMATION "$(MSG_STILL_RUNNING)"
         Abort
       ${EndIf}
@@ -244,14 +306,27 @@ Function DirPageLeave
 FunctionEnd
 
 Function .onInit
+  ${IfNot} ${Silent}
+    ; 交互安装：**一启动就后台开跑**检测。
+    ; 位置刻意放在 MUI_LANGDLL_DISPLAY **之前**：语言选择框是模态的，放在它后面
+    ; 的话预检会被用户「选语言」的时间堵住，白等。
+    ; ExecShell 不等待、SW_HIDE 不弹控制台窗口，PowerShell 的启动开销因此与
+    ; 用户选语言、读欢迎页、挑目录的时间完全重叠。
+    Call WriteCheckScript
+    StrCpy $PrefetchDir "$INSTDIR"
+    Delete "$TEMP\mbvue_running.done"
+    Delete "$TEMP\mbvue_running.flag"
+    ExecShell "open" "powershell.exe" '-NoProfile -ExecutionPolicy Bypass -File "$TEMP\mbvue_check.ps1"' SW_HIDE
+  ${EndIf}
+
   !insertmacro MUI_LANGDLL_DISPLAY
-  ; 静默安装（/S）不走任何页面，DirPageLeave 不会触发，这里兜底：
-  ; 发现占用直接强杀后继续（无人可答）。
+
   ${If} ${Silent}
-    Call CheckRunningApp
+    ; 静默安装（/S）不走任何页面，DirPageLeave 不会触发，这里兜底：
+    ; 无人可答，发现占用就直接关掉后继续。
+    Call RunCheckSync
     ${If} $IsRunning == "1"
       Call KillRunningApp
-      Sleep 1500
     ${EndIf}
   ${EndIf}
 FunctionEnd

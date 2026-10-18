@@ -1,0 +1,6 @@
+build_target/
+vendor/
+node_modules/
+build_dist/
+*.log
+logs

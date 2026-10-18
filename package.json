@@ -1,0 +1,22 @@
+{
+  "name": "rust-vue-miniblink-demo",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 4173",
+    "check:i18n": "python scripts/check_i18n.py",
+    "dist": "bash scripts/make_installer.sh",
+    "dist:only": "bash scripts/make_installer.sh --no-build"
+  },
+  "dependencies": {
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "~5.7.2",
+    "vite": "^6.0.7"
+  }
+}

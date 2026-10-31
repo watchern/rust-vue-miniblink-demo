@@ -2,7 +2,7 @@
 name = "rust-vue-miniblink-demo"
 version = "0.1.0"
 edition = "2021"
-description = "miniblink(Chromium 132) + Vue 3 + Rust 桌面应用 Demo"
+description = "miniblink(Chromium 132)/WebKitGTK + Vue 3 + Rust 桌面应用 Demo"
 build = "build.rs"
 
 [[bin]]
@@ -10,26 +10,69 @@ name = "mbvue"
 path = "src-rs/main.rs"
 
 [dependencies]
-libloading = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sysinfo = "0.33"
 
-[dependencies.windows-sys]
-version = "0.59"
-features = [
+# Windows：miniblink 内核 + Win32 壳
+[target.'cfg(windows)'.dependencies]
+libloading = "0.8"
+windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_SystemInformation",
     "Win32_Graphics_Gdi",
-]
+] }
 
-[build-dependencies]
+# Linux：WebKitGTK 4.1（libsoup3 线）壳，Tauri 同款技术栈。
+# v2_38 与 wry 的选择一致；webkit2gtk crate 2.0 线本身即对应系统包 webkit2gtk-4.1。
+# javascriptcore 的 v2_28 是 Value::to_str（读脚本消息文本）所需；
+# webkit2gtk 的 feature 不会传递给它，必须单独开启。
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+gtk = "0.18"
+javascriptcore-rs = { version = "1.1", features = ["v2_28"] }
+webkit2gtk = { version = "2.0", features = ["v2_38"] }
+
+[target.'cfg(windows)'.build-dependencies]
 # 把 assets/icon.rc 编译成 .res 链接进 exe（Explorer 文件图标 / Alt+Tab）。
 # 内部按 $RC_$TARGET → $RC → 注册表 Windows Kits 的顺序找 rc.exe，本机均有。
 embed-resource = "3.0.12"
 
 [profile.release]
 opt-level = 2
+
+# ---- Linux 打包（deb：cargo-deb；rpm：cargo-generate-rpm）----
+# 产物由 scripts/make_linux_pkgs.sh / CI 生成，路径基于 .cargo/config.toml 的
+# target-dir（build_target/）。
+[package.metadata.deb]
+maintainer = "RPAN <rpan@localhost>"
+copyright = "2026, RPAN"
+extended-description = """\
+mbvue 桌面应用骨架：Vue 3 界面 + Rust 原生宿主。
+Windows 端渲染内核为 miniblink(Chromium 132)，Linux 端为 WebKitGTK 4.1。
+JS <-> Rust 双向 IPC、无边框窗口、内嵌前端资源，见项目 README。"""
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["build_target/release/mbvue", "usr/bin/", "755"],
+    ["assets/icon.png", "usr/share/icons/hicolor/256x256/apps/mbvue.png", "644"],
+    ["packaging/mbvue.desktop", "usr/share/applications/", "644"],
+]
+
+[package.metadata.generate-rpm]
+license = "MIT"
+summary = "Vue 3 + Rust 桌面应用骨架（WebKitGTK 内核）"
+post_install_script = """\
+if command -v update-desktop-database >/dev/null 2>&1; then update-desktop-database -q /usr/share/applications || true; fi"""
+assets = [
+    { source = "build_target/release/mbvue", dest = "/usr/bin/mbvue", mode = "755" },
+    { source = "assets/icon.png", dest = "/usr/share/icons/hicolor/256x256/apps/mbvue.png", mode = "644" },
+    { source = "packaging/mbvue.desktop", dest = "/usr/share/applications/mbvue.desktop", mode = "644" },
+]
+# Fedora/openSUSE 的运行时包名（webkit2gtk-4.1 在 Fedora 上叫 webkit2gtk4.1）
+[package.metadata.generate-rpm.requires]
+gtk3 = "*"
+webkit2gtk4.1 = "*"

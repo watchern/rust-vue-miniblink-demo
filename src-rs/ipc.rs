@@ -1,23 +1,24 @@
-//! JS ⇄ Rust 的命令分发层。
+//! JS ⇄ Rust 的命令分发层（**平台无关**）。
 //!
-//! 入站：miniblink 的 `onJsQuery` 回调拿到 JSON 请求，解析出 {cmd, payload}，
-//!       查表执行后通过 `mbResponseQuery` 回给 JS。
-//! 出站：任意线程调用 `emit()`，经 `mbRunJs` 把事件推到 `window.__mbEmit`。
+//! 入站：两个平台壳各自把 JS 请求送进 `dispatch()`——
+//!   Windows: miniblink `onJsQuery` 回调（platform_win.rs），
+//!   Linux:   WebKitGTK script-message-handler 信号（platform_linux.rs）。
+//! 出站：任意线程调用 `emit()`，经 `platform::eval_js` 把事件推到 `window.__mbEmit`。
+//! 窗口类命令（win.*）一律走 `platform` 门面，这里不出现 Win32 / GTK 代码。
 
-use std::ffi::c_void;
-use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use serde_json::{json, Value};
 
-use crate::ffi;
 use crate::logln;
+use crate::platform;
 
 // ---------------------------------------------------------------- 运行时状态
 
 static VIEW: AtomicI64 = AtomicI64::new(0);
 static PORT: AtomicU32 = AtomicU32::new(0);
+/// Windows：miniblink DLL 路径；Linux：内核描述串（WebKitGTK 无独立内核文件）
 static DLL_PATH: OnceLock<String> = OnceLock::new();
 /// 回退用的磁盘前端目录（仅开发期 / 未内嵌时有意义）。
 /// `app.info` 报给界面的不是这个——那个用 `server::source_desc_global()`，
@@ -25,13 +26,10 @@ static DLL_PATH: OnceLock<String> = OnceLock::new();
 static WEB_ROOT: OnceLock<String> = OnceLock::new();
 static STARTED_AT: OnceLock<u128> = OnceLock::new();
 
-/// 串行化对 mbRunJs / mbResponseQuery 的调用
-static MB_LOCK: Mutex<()> = Mutex::new(());
-
-pub fn init_runtime(view: i64, port: u16, dll: String, web_root: String) {
+pub fn init_runtime(view: i64, port: u16, kernel: String, web_root: String) {
     VIEW.store(view, Ordering::SeqCst);
     PORT.store(port as u32, Ordering::SeqCst);
-    let _ = DLL_PATH.set(dll);
+    let _ = DLL_PATH.set(kernel);
     let _ = WEB_ROOT.set(web_root);
     let _ = STARTED_AT.set(now_millis());
 }
@@ -41,14 +39,6 @@ pub fn current_view() -> i64 {
 }
 
 // ---------------------------------------------------------------- 出站事件
-
-unsafe extern "system" fn noop_runjs_cb(
-    _view: ffi::MbWebView,
-    _param: *mut c_void,
-    _es: ffi::MbJsExecState,
-    _v: ffi::MbJsValue,
-) {
-}
 
 /// 把事件推给前端：`window.__mbEmit({event, data, ts})`
 pub fn emit(event: &str, data: Value) {
@@ -65,22 +55,8 @@ pub fn emit(event: &str, data: Value) {
     if std::env::var("MB_TRACE").is_ok() {
         logln!("[emit] {}", &js[..js.len().min(140)]);
     }
-    let c = ffi::cstr(&js);
-
-    let _guard = MB_LOCK.lock();
-    let mb = ffi::mb();
-    unsafe {
-        let frame = (mb.mbWebFrameGetMainFrame)(view);
-        (mb.mbRunJs)(
-            view,
-            frame,
-            c.as_ptr() as *const c_char,
-            1,
-            noop_runjs_cb,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-    }
+    // 派发到 webview：Windows 经 mbRunJs，Linux 经 evaluate_javascript（主线程）
+    platform::eval_js(js);
 }
 
 // ---------------------------------------------------------------- 入站分发
@@ -108,12 +84,12 @@ fn run(cmd: &str, p: &Value) -> Result<Value, String> {
         "app.info" => Ok(json!({
             "name": "rust-vue-miniblink-demo",
             "version": env!("CARGO_PKG_VERSION"),
-            "engine": "miniblink 132 (Chromium 132)",
+            "engine": crate::ENGINE_NAME,
             "dll": DLL_PATH.get().cloned().unwrap_or_default(),
             // 资源来源：内嵌时报「内嵌于 exe」，不报编译机的 build_dist 路径
             // （那个路径对终端用户无意义，还会暴露开发者本机目录）。
             "webRoot": crate::server::source_desc_global(),
-            "userData": crate::user_data_dir().display().to_string(),
+            "userData": platform::user_data_dir().display().to_string(),
             "localPort": PORT.load(Ordering::SeqCst),
             "pid": std::process::id(),
             "arch": std::env::consts::ARCH,
@@ -126,22 +102,11 @@ fn run(cmd: &str, p: &Value) -> Result<Value, String> {
             let cur = crate::i18n::set_locale(get_str(p, "locale", "zh-CN"));
             Ok(json!({ "locale": cur }))
         }
-        // 前端主题生效时同步过来：让壳的兜底背景色（WM_ERASEBKGND）跟着变，
-        // 启动瞬间/缩放过程中 webview 未及时重画时不会闪一下浅色。
+        // 前端主题生效时同步过来：Windows 端给无边框窗口那圈兜底背景上色
+        // （启动瞬间/缩放过程中 webview 未及时重画时不闪浅色）；Linux 无需处理。
         "app.setTheme" => {
             let th = get_str(p, "theme", "light");
-            let dark = th == "dark";
-            crate::FRAME_DARK.store(dark, Ordering::Relaxed);
-            // 主题变了但窗口没 resize，兜底背景不会被自动重擦 → 主动失效+擦除。
-            // 只失效父窗口：webview 不受影响、不会重绘，故不闪。
-            with_hwnd(|h| unsafe {
-                windows_sys::Win32::Graphics::Gdi::RedrawWindow(
-                    h,
-                    std::ptr::null(),
-                    std::ptr::null_mut(),
-                    0x0001 | 0x0002 | 0x0100, // RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW
-                );
-            })?;
+            platform::set_theme(th == "dark");
             Ok(json!({ "theme": th }))
         }
 
@@ -165,65 +130,35 @@ fn run(cmd: &str, p: &Value) -> Result<Value, String> {
             }))
         }
 
-        // ---------------- 窗口 ----------------
+        // ---------------- 窗口（全部走平台门面）----------------
         "win.minimize" => {
-            // 收进托盘（隐藏窗口），托盘图标是恢复/退出的入口
-            win_cmd(
-                |h| unsafe { windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(h, 0) },
-                "minimize",
-            )
+            // Windows：收进托盘（隐藏窗口），托盘图标是恢复/退出的入口；
+            // Linux：无托盘实现，语义为最小化到任务栏。
+            platform::win_minimize()?;
+            Ok(json!({ "action": "minimize", "ok": true }))
         }
         "win.maximize" => {
-            // 已最大化则还原，否则最大化；返回新的最大化状态
-            let zoomed = with_hwnd(|h| unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsZoomed(h) })?
-                != 0;
-            let code = if zoomed { 9 } else { 3 }; // SW_RESTORE / SW_MAXIMIZE
-            win_cmd(
-                |h| unsafe { windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(h, code) },
-                "maximize",
-            )?;
-            Ok(json!({ "maximized": !zoomed }))
+            let maximized = platform::win_maximize()?;
+            Ok(json!({ "maximized": maximized }))
         }
         "win.close" => {
-            win_cmd(
-                |h| unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(h) },
-                "close",
-            )
+            platform::win_close()?;
+            Ok(json!({ "action": "close", "ok": true }))
         }
         "win.drag" => {
-            // 无边框窗口拖拽：伪造一次标题栏按下
-            win_cmd(
-                |h| unsafe {
-                    windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
-                    windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(h, 0x00A1, 2, 0);
-                },
-                "drag",
-            )
+            // 无边框窗口拖拽：Windows 伪造标题栏按下，Linux 走 begin_move_drag
+            platform::win_drag()?;
+            Ok(json!({ "action": "drag", "ok": true }))
         }
         "win.title" => {
             let t = get_str(p, "title", "");
-            let c = ffi::cstr(t);
-            let mb = ffi::mb();
-            unsafe { (mb.mbSetWindowTitle)(current_view(), c.as_ptr() as *const c_char) };
+            platform::win_set_title(t)?;
             Ok(json!({ "title": t }))
         }
         "win.getSize" => {
-            // 前端 resize handle 拖拽时读基准尺寸（miniblink 的 WndProc
-            // 不实现 WM_NCHITTEST 边缘缩放路径，只能前端自己算目标尺寸）
-            let size = with_hwnd(|hwnd| unsafe {
-                let mut r = windows_sys::Win32::Foundation::RECT {
-                    left: 0,
-                    top: 0,
-                    right: 0,
-                    bottom: 0,
-                };
-                if windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut r) == 0 {
-                    (0, 0)
-                } else {
-                    (r.right - r.left, r.bottom - r.top)
-                }
-            })?;
-            Ok(json!({ "w": size.0, "h": size.1 }))
+            // 前端 resize handle 拖拽时读基准尺寸
+            let (w, h) = platform::win_get_size()?;
+            Ok(json!({ "w": w, "h": h }))
         }
         "win.resize" => {
             // 钳到 [最小, 16384]；宽高独立钳制，不动的维度不受影响。
@@ -233,35 +168,13 @@ fn run(cmd: &str, p: &Value) -> Result<Value, String> {
             let w = (rw as i32).clamp(crate::WIN_MIN_W, 16384);
             let h = (rh as i32).clamp(crate::WIN_MIN_H, 16384);
             if rw > 0 && rh > 0 {
-                win_cmd(
-                    |hwnd| unsafe {
-                        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos(
-                            hwnd,
-                            std::ptr::null_mut(),
-                            0,
-                            0,
-                            w,
-                            h,
-                            0x0002 | 0x0004, // SWP_NOMOVE | SWP_NOZORDER
-                        );
-                    },
-                    "resize",
-                )?;
+                platform::win_resize(w, h)?;
             }
             Ok(json!({ "w": w, "h": h }))
         }
 
         // ---------------- 文件 ----------------
-        "fs.drives" => {
-            let mut out = Vec::new();
-            for b in b'A'..=b'Z' {
-                let root = format!("{}:\\", b as char);
-                if std::path::Path::new(&root).exists() {
-                    out.push(json!({ "name": root, "path": root }));
-                }
-            }
-            Ok(json!(out))
-        }
+        "fs.drives" => fs_drives(),
         "fs.list" => fs_list(get_str(p, "path", ".")),
         "fs.read" => fs_read(get_str(p, "path", ""), 256 * 1024),
         "fs.write" => fs_write(get_str(p, "path", ""), get_str(p, "content", "")),
@@ -354,6 +267,40 @@ fn sys_info() -> Result<Value, String> {
 
 // ---------------------------------------------------------------- 文件操作
 
+/// 盘符列表：Windows 扫 A:-Z:；Linux 没有盘符概念，列挂载点（对齐 sysinfo 的 Disks）。
+fn fs_drives() -> Result<Value, String> {
+    #[cfg(windows)]
+    {
+        let mut out = Vec::new();
+        for b in b'A'..=b'Z' {
+            let root = format!("{}:\\", b as char);
+            if std::path::Path::new(&root).exists() {
+                out.push(json!({ "name": root, "path": root }));
+            }
+        }
+        Ok(json!(out))
+    }
+    #[cfg(not(windows))]
+    {
+        use sysinfo::Disks;
+        let mut out: Vec<Value> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        for d in Disks::new_with_refreshed_list().iter() {
+            let mp = d.mount_point().to_string_lossy().to_string();
+            if seen.iter().any(|s| mp.starts_with(s.as_str())) {
+                continue; // 子挂载点不重复列
+            }
+            seen.push(mp.clone());
+            let name = d.name().to_string_lossy().to_string();
+            out.push(json!({
+                "name": if name.is_empty() { mp.clone() } else { name },
+                "path": mp,
+            }));
+        }
+        Ok(json!(out))
+    }
+}
+
 fn fs_list(path: &str) -> Result<Value, String> {
     let base = resolve(path)?;
     let rd = std::fs::read_dir(&base).map_err(|e| crate::i18n::read_dir_failed(&e.to_string()))?;
@@ -436,25 +383,6 @@ fn resolve(path: &str) -> Result<std::path::PathBuf, String> {
     Ok(out)
 }
 
-// ---------------------------------------------------------------- 窗口辅助
-
-fn with_hwnd<T>(f: impl FnOnce(windows_sys::Win32::Foundation::HWND) -> T) -> Result<T, String> {
-    let view = current_view();
-    if view == 0 {
-        return Err(crate::i18n::webview_not_ready());
-    }
-    let h = unsafe { (ffi::mb().mbGetHostHWND)(view) };
-    if h.is_null() {
-        return Err(crate::i18n::no_hwnd());
-    }
-    Ok(f(h))
-}
-
-fn win_cmd<R>(f: impl FnOnce(windows_sys::Win32::Foundation::HWND) -> R, name: &str) -> Result<Value, String> {
-    with_hwnd(f)?;
-    Ok(json!({ "action": name, "ok": true }))
-}
-
 // ---------------------------------------------------------------- 定时器
 
 static TICKER: AtomicBool = AtomicBool::new(false);
@@ -511,40 +439,4 @@ pub fn now_millis() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
-}
-
-/// onJsQuery 的 C 回调：解析请求 → 分发 → 回包
-pub unsafe extern "system" fn on_js_query(
-    view: ffi::MbWebView,
-    _param: *mut c_void,
-    _es: ffi::MbJsExecState,
-    query_id: i64,
-    custom_msg: c_int,
-    request: *const c_char,
-) {
-    if request.is_null() {
-        return;
-    }
-    let raw = std::ffi::CStr::from_ptr(request).to_string_lossy().to_string();
-    if std::env::var("MB_TRACE").is_ok() {
-        logln!("[ipc] <- {}", &raw[..raw.len().min(160)]);
-    }
-
-    let response = match serde_json::from_str::<Value>(&raw) {
-        Ok(v) => {
-            let cmd = v.get("cmd").and_then(|c| c.as_str()).unwrap_or("").to_string();
-            let payload = v.get("payload").cloned().unwrap_or(Value::Null);
-            dispatch(&cmd, &payload)
-        }
-        Err(e) => json!({ "ok": false, "error": crate::i18n::json_parse_failed(&e.to_string()) }),
-    };
-
-    let out = response.to_string();
-    if std::env::var("MB_TRACE").is_ok() {
-        logln!("[ipc] -> {}", &out[..out.len().min(200)]);
-    }
-    let c = ffi::cstr(&out);
-    let mb = ffi::mb();
-    let _guard = MB_LOCK.lock();
-    (mb.mbResponseQuery)(view, query_id, custom_msg, c.as_ptr() as *const c_char);
 }

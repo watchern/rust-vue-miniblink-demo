@@ -1,5 +1,9 @@
-//! 把 miniblink 运行时 DLL 拷贝到 cargo 的产物目录（target/<profile>/），
-//! 这样 `cargo run` 出来的 exe 能直接找到 core.dll（开发期名 mb132_x64.dll）。
+//! 构建脚本。
+//!
+//! 跨平台分工：
+//!   · 前端产物资源表（`$OUT_DIR/mb_assets.rs`）—— 两个平台共用；
+//!   · miniblink DLL 部署 / icon.rc 嵌入 / icon.ico 部署 —— 仅 Windows
+//!     （`CARGO_CFG_WINDOWS` 由 cargo 按 cfg 注入，Linux 构建自动跳过）。
 //!
 //! DLL 本体（68MB）放在 vendor/miniblink/ 下，不经 git 追踪，
 //! 首次获取方式见 scripts/fetch-miniblink.sh。
@@ -15,10 +19,20 @@ fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
-    // ---- 前端产物：生成内嵌资源表 ----
+    // ---- 前端产物：生成内嵌资源表（两平台共用）----
     emit_asset_table(&manifest, &out_dir);
 
-    // ---- miniblink DLL 部署到 cargo 产物目录 ----
+    println!("cargo:rerun-if-changed=build.rs");
+
+    // ---- Windows 专属：DLL 部署 + 图标 ----
+    if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
+        deploy_windows_runtime(&manifest, &out_dir);
+    }
+}
+
+/// Windows：miniblink DLL 部署到 cargo 产物目录 + exe 图标资源 + 运行时窗口图标。
+fn deploy_windows_runtime(manifest: &Path, out_dir: &Path) {
+    // DLL 部署
     let dll_names = ["mb132_x64.dll", "mb132_x32.dll"];
 
     // OUT_DIR = <target>/<profile>/build/<pkg>-<hash>/out
@@ -51,13 +65,12 @@ fn main() {
     if header.exists() {
         println!("cargo:rerun-if-changed={}", header.display());
     }
-    println!("cargo:rerun-if-changed=build.rs");
 
     // 让代码里能拿到部署后的 DLL 目录，作为运行时搜索兜底
     println!("cargo:rustc-env=MB_TARGET_DIR={}", Path::new(target_dir).display());
 
     // ---- Windows 图标 ----
-    // 1) exe 内嵌图标资源（Explorer 文件管理器里的文件图标、Alt+Tab 大图标）：
+    // 1) exe 内嵌图标资源（Explorer 文件管理器里的文件图标、Alt+Tab）：
     //    embed-resource 调 rc.exe 把 assets/icon.rc 编成 .res，以
     //    cargo:rustc-link-arg-bins 链进 mbvue.exe。
     //    .rc 里的 "assets/icon.ico" 相对路径基于 build script 的工作目录解析，

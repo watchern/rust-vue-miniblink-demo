@@ -33,8 +33,11 @@ use std::sync::{Mutex, OnceLock};
 
 use gtk::prelude::*;
 use gtk::glib;
-
 use serde_json::Value;
+// webkit2gtk 没有 prelude 模块（与 gtk 不同）：方法挂在 WebViewExt /
+// UserContentManagerExt 上，由 lib.rs 的 `pub use auto::traits::*` 导出到根，
+// 必须具名引入
+use webkit2gtk::{UserContentManagerExt, WebViewExt};
 use webkit2gtk::{
     JavascriptResult, LoadEvent, UserContentInjectedFrames, UserScript, UserScriptInjectionTime,
     WebView,
@@ -166,6 +169,9 @@ pub(crate) fn run(opts: Options) {
     // 回包（__mbResolve）也走这条，与事件推送保持同一队列顺序。
     // 注意：glib 0.18 的 Receiver 只有 attach(FnMut) 回调式 API，没有 async recv；
     // channel 的优先级用 Priority::DEFAULT（根命名空间没有 PRIORITY_DEFAULT 常量）。
+    // channel API 在 0.18.5 标记了 deprecated（建议 glib 0.19 的 async-channel），
+    // 0.18 线上它仍是稳定可用路径。
+    #[allow(deprecated)]
     let (tx, rx) = glib::MainContext::channel::<String>(glib::Priority::DEFAULT);
     let _ = JS_TX.set(Mutex::new(Some(tx)));
     {
@@ -412,7 +418,8 @@ pub(crate) fn win_maximize() -> Result<bool, String> {
 
 pub(crate) fn win_close() -> Result<(), String> {
     let win = window()?;
-    save_geom(win);
+    // win 是 clone 出来的所有权句柄，save_geom 收引用
+    save_geom(&win);
     gtk::main_quit();
     Ok(())
 }

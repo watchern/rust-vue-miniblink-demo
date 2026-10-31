@@ -118,7 +118,10 @@ jobs:
 
   linux:
     name: Linux (deb / rpm / AppImage / tar.gz)
-    runs-on: ubuntu-latest
+    # 钉 24.04：构建机 glibc 决定二进制的最低运行版本（24.04 = glibc 2.39，
+    # 兼容 Ubuntu 24.04+/Debian 13+/Fedora 40+）；ubuntu-latest 已迁到 26.04，
+    # glibc 更新会把老发行版挡在门外
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -220,5 +223,8 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          # 发布说明模板（系统要求/运行库/安装方式），generate_release_notes
+          # 会把 What's Changed 与 Full Changelog 追加在后面
+          body_path: packaging/release-notes.md
           files: dist/*
           generate_release_notes: true

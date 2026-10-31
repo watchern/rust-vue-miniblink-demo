@@ -94,8 +94,27 @@ find "$CARGO_TARGET_DIR" -maxdepth 3 -name '*.rpm' -print -quit | {
 [[ -f "$DIST/${NAME_BASE}.deb" ]] || { echo "[linux-pkg] 没找到 .deb 产物" >&2; exit 1; }
 [[ -f "$DIST/${NAME_BASE}.rpm" ]] || { echo "[linux-pkg] 没找到 .rpm 产物" >&2; exit 1; }
 
+# ---------------------------------------------------------------- tar.gz 便携包
+echo "[linux-pkg] 4/5 tar.gz 便携包…"
+STAGE="$ROOT/build_target/portable"
+rm -rf "$STAGE"
+mkdir -p "$STAGE/$NAME_BASE"
+cp "$TARGET/mbvue"   "$STAGE/$NAME_BASE/"
+cp assets/icon.png   "$STAGE/$NAME_BASE/"
+cat > "$STAGE/$NAME_BASE/README.txt" <<EOF
+mbvue ${VER} (linux-x64) 便携版
+
+  ./mbvue              运行（需要系统已装 libwebkit2gtk-4.1 / libgtk-3；
+                       Ubuntu/Debian: sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0）
+  --web <dir>          指定前端产物目录（默认使用内嵌资源）
+  --url <url>          直接加载指定 URL
+
+配置/日志落在 \$XDG_DATA_HOME/mbvue/（默认 ~/.local/share/mbvue/）。
+EOF
+tar -czf "$DIST/${NAME_BASE}.tar.gz" -C "$STAGE" "$NAME_BASE"
+
 # ---------------------------------------------------------------- AppImage
-echo "[linux-pkg] 4/5 AppImage（linuxdeploy）…"
+echo "[linux-pkg] 5/5 AppImage（linuxdeploy）…"
 
 APPDIR="$ROOT/build_target/AppDir"
 rm -rf "$APPDIR"
@@ -138,49 +157,31 @@ fi
 chmod +x "$APPRUN"
 cp "$APPRUN" "$APPDIR/AppRun"
 
-# linuxdeploy：扫描 AppDir/usr/bin 的 ELF 并把动态库依赖收进 AppDir；
-# --plugin gtk 负责 glib schemas / gio modules / gdk-pixbuf loaders。
+# linuxdeploy：扫描 AppDir/usr/bin 的 ELF 并把动态库依赖收进 AppDir。
+# 不用 --plugin gtk：Ubuntu 26 的 gdk-pixbuf 目录结构让插件的
+# copy_lib_tree 失败（cp: cannot stat 'gdk-pixbuf-2.0/2.10.0'）；
+# 而纯 webview 应用不需要它打包的东西——不加载 GTK 图标（无需 pixbuf
+# loaders）、只走本地 http（无需 gio TLS 模块）、无 GSettings 依赖。
 LINUXDEPLOY="$TOOLS/linuxdeploy-$ARCH.AppImage"
 if [[ ! -f "$LINUXDEPLOY" ]]; then
   download "${LINUXDEPLOY_URL:-https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-$ARCH.AppImage}" "$LINUXDEPLOY"
 fi
 chmod +x "$LINUXDEPLOY"
-# gtk 插件是独立脚本，linuxdeploy 会按名字在 PATH/自身目录里找
-GTK_PLUGIN="$TOOLS/linuxdeploy-plugin-gtk.sh"
-if [[ ! -f "$GTK_PLUGIN" ]]; then
-  download "${GTK_PLUGIN_URL:-https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh}" "$GTK_PLUGIN"
-fi
-chmod +x "$GTK_PLUGIN"
 
 export APPIMAGE_EXTRACT_AND_RUN=1   # CI 无 libfuse，AppImage 一律解压运行
 export ARCH="$ARCH"
 export OUTPUT="$DIST/${NAME_BASE}.AppImage"
-PATH="$TOOLS:$PATH" "$LINUXDEPLOY" \
-  --appimage-extract-and-run \
-  --verbosity=1 \
-  --appdir "$APPDIR" \
-  --plugin gtk \
-  --output appimage
-[[ -f "$OUTPUT" ]] || { echo "[linux-pkg] AppImage 打包失败" >&2; exit 1; }
-
-# ---------------------------------------------------------------- tar.gz 便携包
-echo "[linux-pkg] 5/5 tar.gz 便携包…"
-STAGE="$ROOT/build_target/portable"
-rm -rf "$STAGE"
-mkdir -p "$STAGE/$NAME_BASE"
-cp "$TARGET/mbvue"   "$STAGE/$NAME_BASE/"
-cp assets/icon.png   "$STAGE/$NAME_BASE/"
-cat > "$STAGE/$NAME_BASE/README.txt" <<EOF
-mbvue ${VER} (linux-x64) 便携版
-
-  ./mbvue              运行（需要系统已装 libwebkit2gtk-4.1 / libgtk-3；
-                       Ubuntu/Debian: sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0）
-  --web <dir>          指定前端产物目录（默认使用内嵌资源）
-  --url <url>          直接加载指定 URL
-
-配置/日志落在 \$XDG_DATA_HOME/mbvue/（默认 ~/.local/share/mbvue/）。
-EOF
-tar -czf "$DIST/${NAME_BASE}.tar.gz" -C "$STAGE" "$NAME_BASE"
+# AppImage 是四种格式里最脆的（WebKit 助手/插件/发行版差异），失败不拖垮
+# 其它产物：deb/rpm/tar.gz 已在前面打出
+if ! PATH="$TOOLS:$PATH" "$LINUXDEPLOY" \
+      --appimage-extract-and-run \
+      --verbosity=1 \
+      --appdir "$APPDIR" \
+      --output appimage; then
+  echo "[linux-pkg] 警告：AppImage 打包失败（deb/rpm/tar.gz 已产出，详见上方 linuxdeploy 日志）" >&2
+else
+  [[ -f "$OUTPUT" ]] || echo "[linux-pkg] 警告：linuxdeploy 未报错但 AppImage 不存在" >&2
+fi
 
 # ---------------------------------------------------------------- 汇总
 echo ""

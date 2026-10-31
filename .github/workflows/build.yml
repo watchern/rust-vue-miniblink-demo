@@ -1,0 +1,169 @@
+# 自动构建：Windows 安装包/便携 zip + Linux deb/rpm/AppImage/tar.gz。
+#
+# 触发：
+#   · workflow_dispatch —— 手动（Actions 页面 Run workflow）
+#   · push tag v*       —— 构建并创建 GitHub Release，附全部产物
+#
+# 产物矩阵：
+#   windows: mbvue-<ver>-windows-x64-setup.exe（NSIS 安装包）
+#            mbvue-<ver>-windows-x64.zip（绿色便携包）
+#   linux:   mbvue-<ver>-linux-x64.{deb,rpm,AppImage,tar.gz}
+#
+# 注意：
+#   · GitHub 托管 Windows runner 已不预装 NSIS，需 choco install nsis
+#   · miniblink 68MB DLL 不进 git，CI 用 scripts/fetch-miniblink.sh 下载并缓存
+#   · Linux 端不依赖 miniblink（WebKitGTK 壳），无需下载 SDK
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # release job 要创建 Release
+
+env:
+  # 与 scripts/fetch-miniblink.sh 的默认 tag 一致（缓存 key 用）
+  MINIBLINK_TAG: "20251212"
+
+jobs:
+  windows:
+    name: Windows (setup.exe / zip)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Fetch miniblink SDK (cached)
+        uses: actions/cache@v4
+        with:
+          path: vendor/miniblink
+          key: miniblink-${{ env.MINIBLINK_TAG }}
+
+      - name: Download miniblink SDK
+        shell: bash
+        run: bash scripts/fetch-miniblink.sh
+
+      # runner 镜像已不再预装 NSIS；choco 的 nsis 包会把 makensis 放进 PATH，
+      # make_installer.sh 的 find_makensis 优先认 PATH
+      - name: Install NSIS
+        shell: bash
+        run: |
+          if ! command -v makensis >/dev/null 2>&1; then
+            choco install nsis -y --no-progress
+          fi
+
+      - name: Build & package (NSIS setup.exe + portable dir)
+        shell: bash
+        run: bash scripts/make_installer.sh
+
+      - name: Tests
+        shell: bash
+        run: cargo test --release
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          VER="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          BASE="mbvue-${VER}-windows-x64"
+          mkdir -p build_target/out
+          cp build_target/mbvue-Setup.exe "build_target/out/${BASE}-setup.exe"
+          # 绿色版：安装器组装出的 install/ 目录原样压 zip，解压即跑
+          ( cd build_target/install && powershell -NoProfile -Command \
+              "Compress-Archive -Path * -DestinationPath '..\\out\\${BASE}.zip' -Force" )
+          ls -lh build_target/out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: build_target/out/*
+          if-no-files-found: error
+
+  linux:
+    name: Linux (deb / rpm / AppImage / tar.gz)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install WebKitGTK/GTK dev packages
+        run: |
+          sudo apt-get update
+          # libwebkit2gtk-4.1 = libsoup3 线（webkit2gtk crate 2.0 对应的系统包）
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libwebkit2gtk-4.1-dev
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Tests
+        run: cargo test --release
+
+      # cargo-deb 有预编译制品，装得快；cargo-generate-rpm 不在清单里，cargo install
+      - name: Install packaging tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm --locked
+
+      - name: Package (deb / rpm / AppImage / tar.gz)
+        run: bash scripts/make_linux_pkgs.sh --no-build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: build_target/dist/*
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: List artifacts
+        run: ls -lh dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

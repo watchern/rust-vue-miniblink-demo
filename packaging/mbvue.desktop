@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=mbvue
+GenericName=Desktop App Demo
+Comment=Vue 3 + Rust desktop app skeleton (miniblink / WebKitGTK engine)
+Exec=mbvue
+Icon=mbvue
+Terminal=false
+Categories=Utility;Development;
+Keywords=vue;rust;webview;demo;
+StartupWMClass=mbvue

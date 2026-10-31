@@ -2,6 +2,8 @@
 
 用 **miniblink（Chromium 132 内核，单个 DLL）** 做渲染， **Vue 3 + Vite** 写界面， **Rust** 做原生宿主和业务逻辑的桌面应用骨架。
 
+**跨平台**：Windows 用 miniblink；Linux 用 WebKitGTK 4.1 壳（前端零改动，见「Linux 支持」）。GitHub Actions 自动构建 Windows 安装包/便携 zip 与 Linux deb/rpm/AppImage（见「GitHub Actions 自动构建」）。
+
 ![screenshot](docs/screenshot.png)
 
 - 无边框窗口，标题栏完全由 Vue 绘制（最小化 / 最大化 / 关闭 / 拖拽都走 JS → Rust）
@@ -17,6 +19,8 @@
 
 ## 快速开始
 
+Windows：
+
 ```bash
 # 1) 获取 miniblink SDK（68MB，GitHub 不通时自动走镜像）
 bash scripts/fetch-miniblink.sh
@@ -29,6 +33,17 @@ bash scripts/build.sh
 
 # 4) 需要安装包时（NSIS，界面仅中英双语）
 pnpm run dist            # → build_target/mbvue-Setup.exe（19.65 MB）
+```
+
+Linux（WebKitGTK 4.1 壳，无需 miniblink）：
+
+```bash
+# 1) 系统依赖（Ubuntu 22.04+/Debian 12+）
+sudo apt install -y libgtk-3-dev libwebkit2gtk-4.1-dev
+
+# 2) 一键构建 + 全部打包（deb / rpm / AppImage / tar.gz）
+CI=true pnpm install && bash scripts/make_linux_pkgs.sh
+# 只打包不重新编译：bash scripts/make_linux_pkgs.sh --no-build
 ```
 
 开发模式（前端热更新）：
@@ -345,6 +360,90 @@ python scripts/verify_installer.py     # 安装 → 启动 → 截图 → 占用
 
 ---
 
+## GitHub Actions 自动构建
+
+`.github/workflows/build.yml`，触发时机：**手动**（Actions 页 Run workflow）或 **push `v*` 标签**。
+
+| 平台 | Runner | 产物 |
+|---|---|---|
+| Windows | `windows-latest` | `mbvue-<ver>-windows-x64-setup.exe`（NSIS 安装包）<br>`mbvue-<ver>-windows-x64.zip`（绿色便携包，由安装器的 install/ 目录压缩） |
+| Linux | `ubuntu-latest` | `mbvue-<ver>-linux-x64.deb` / `.rpm` / `.AppImage` / `.tar.gz` |
+
+- push 标签时 `release` job 会创建 GitHub Release 并附上全部产物（自动生成 release notes）
+- Windows job：miniblink SDK 下载走 `actions/cache`（key 固定 `miniblink-20251212`）；
+  **runner 镜像已不预装 NSIS**，workflow 里 `choco install nsis`
+- Linux job：装 `libgtk-3-dev libwebkit2gtk-4.1-dev` 后直接编译，不需要 miniblink；
+  打包工具 `cargo-deb`（taiki-e/install-action 预编译制品）+ `cargo-generate-rpm`（cargo install）
+
+> AppImage 的 WebKit 多进程助手打包首次跑 CI 时最可能需要微调（见下节），deb/rpm/zip 是稳定兜底。
+
+---
+
+## Linux 支持
+
+miniblink 官方 release 只发 Windows DLL（Linux 侧那份 `wkexe_linux.cpp` 是源码级 demo，
+从源码编 Chromium 内核对发布不可行），所以 **Linux 端内核换用 WebKitGTK 4.1（libsoup3 线）**
+——Tauri/wry 在 Linux 上的同款技术栈。
+
+代码组织：
+
+```
+src-rs/
+  main.rs            通用入口：参数解析 / 日志 / config.json 读写，分发到平台壳
+  platform.rs        平台门面：win.* 命令、eval_js、user_data_dir 等统一签名
+  platform_win.rs    Windows 壳（miniblink DLL + Win32，原 main.rs 全量搬入）
+  platform_linux.rs  Linux 壳（GTK3 + WebKitGTK 4.1）
+  ipc.rs / server.rs / log.rs / i18n.rs   平台无关，两端共用
+```
+
+### JS 桥是怎么对齐的
+
+前端 `bridge.ts` 只认两个全局：`window.mbQuery(customMsg, request, cb)` 与 `window.__mbEmit`。
+Linux 端用 WebKit 的 UserContentManager 复刻：
+
+- **入站**：document-start 注入一段 shim，把 `window.mbQuery(...)` 转成
+  `webkit.messageHandlers.mbvue.postMessage({id, request})`；Rust 在
+  `script-message-received` 信号里取回字符串 → 与 Windows 完全同一份 `ipc::dispatch()` →
+  `run_javascript("window.__mbResolve(id, …)")` 触发回调
+- **出站**：`ipc::emit()` → `platform::eval_js()`（Windows 走 `mbRunJs`，Linux 经
+  glib MainContext channel 派发到主线程 `run_javascript` 调 `window.__mbEmit`）
+
+前端**零改动**，两端的命令表、配置持久化（config.json 的 `window` 段格式也一致）、
+i18n 完全共用。
+
+### 能力对照与已知差异
+
+| 能力 | Windows | Linux |
+|---|---|---|
+| 无边框窗口 / 前端标题栏 | WS_POPUP + NCCALCSIZE | `set_decorated(false)` |
+| 标题栏拖拽 | 伪造 WM_NCLBUTTONDOWN | `begin_move_drag`（X11 可靠；**Wayland** 要求真实指针事件发起，由合成器裁决） |
+| 边缘缩放 | WM_NCHITTEST 原生命中带 | 无系统命中带，仅前端 ResizeHandle 把手 |
+| 最大化/还原/关闭 | ShowWindow / DestroyWindow | gtk maximize / unmaximize / main_quit |
+| 最小化 | 收进托盘（SW_HIDE） | **无托盘实现** → 最小化到任务栏（iconify） |
+| 窗口图标 | icon.ico（WM_SETICON） | icon.png（set_icon_from_file） |
+| 主题兜底色 | WM_ERASEBKGND 补色 | 无需（窗口背景即页面） |
+| 用户数据目录 | exe 同级 → `%LOCALAPPDATA%\mbvue` | `$XDG_DATA_HOME/mbvue`（默认 `~/.local/share/mbvue`） |
+| 日志 | `<项目>/logs/mbvue.log` | `<user_data>/mbvue.log` |
+| 引擎上报 | miniblink 132 (Chromium 132) | WebKitGTK 4.1 |
+
+### 打包
+
+`scripts/make_linux_pkgs.sh` 一键产出四种（详见脚本头注释）：
+
+- **deb**：`cargo-deb`，`depends=$auto` 按 ldd 自动算（自动带上 libwebkit2gtk-4.1-0 等运行时）
+- **rpm**：`cargo-generate-rpm`，requires 声明 Fedora 包名（gtk3 / webkit2gtk4.1）
+- **AppImage**：linuxdeploy 收库 + `--plugin gtk`；**WebKit 多进程助手**
+  （`WebKitWebProcess` / `WebKitNetworkProcess` / injected bundle）按系统绝对路径原样复制进
+  AppDir——WebKitGTK 按编译期前缀找它们，保持相同相对布局 + AppRun 的 LD_LIBRARY_PATH
+  才能从 squashfs 里启动渲染进程（Tauri bundler 同款做法）；CI 无 libfuse，全程
+  `APPIMAGE_EXTRACT_AND_RUN=1`
+- **tar.gz**：mbvue + icon.png 便携包，兜底格式（需系统已装 WebKitGTK 运行时）
+
+deb/rpm 的 desktop 文件与图标见 `packaging/`，配置由 `Cargo.toml` 的
+`[package.metadata.deb]` / `[package.metadata.generate-rpm]` 声明。
+
+---
+
 ## 目录结构
 
 前端在**项目根**，Rust 单独放 `src-rs/`，两类构建产物各自独立成目录，互不干扰：
@@ -352,23 +451,30 @@ python scripts/verify_installer.py     # 安装 → 启动 → 截图 → 占用
 ```
 rust-vue-miniblink-demo/
 ├─ src-rs/             Rust 宿主源码（Cargo.toml 的 [[bin]] path 指向这里）
-│  ├─ main.rs          入口：加载 DLL、建窗口、消息循环
-│  ├─ ffi.rs           miniblink C API 的 Rust 绑定（运行时解析符号）
+│  ├─ main.rs          通用入口：参数解析 / config.json，分发到平台壳
+│  ├─ platform.rs      平台门面（win.* 命令 / eval_js / user_data_dir 统一签名）
+│  ├─ platform_win.rs  Windows 壳：miniblink + Win32（无边框/托盘/原生缩放）
+│  ├─ platform_linux.rs Linux 壳：GTK3 + WebKitGTK 4.1
+│  ├─ ffi.rs           miniblink C API 的 Rust 绑定（运行时解析符号，仅 Windows）
 │  ├─ i18n.rs          壳侧文案表（IPC 报错随界面语种切换）
-│  ├─ ipc.rs           命令分发 + Rust→JS 事件推送
-│  └─ server.rs        内置 HTTP 服务，托管 build_dist/
+│  ├─ ipc.rs           命令分发 + Rust→JS 事件推送（平台无关）
+│  ├─ log.rs           轻量日志（stderr + 文件）
+│  └─ server.rs        内置 HTTP 服务，托管 build_dist/（平台无关）
 ├─ src/                Vue 3 前端源码（index.html + vite.config.ts 在根）
 │  ├─ bridge.ts        mbQuery → Promise 的桥接层
 │  └─ i18n/index.ts    零依赖 i18n 运行时 + 中英文案表（各 140 key）
 ├─ assets/             icon.ico / icon.png / icon.rc（exe 内嵌 + 窗口图标）
+├─ packaging/          Linux 打包资源（mbvue.desktop）
 ├─ build_dist/         前端产物（vite build 输出，outDir 见 vite.config.ts）
 ├─ build_target/       cargo 产物（.cargo/config.toml 的 target-dir）
 │  ├─ release/         mbvue.exe + mb132_x64.dll
 │  ├─ install/         便携目录（绿色版）
+│  ├─ dist/            Linux 打包产物（deb/rpm/AppImage/tar.gz）
 │  └─ mbvue-Setup.exe  NSIS 安装器
 ├─ vendor/miniblink/   mb132_x64.dll + mb.h（68MB，不入库）
+├─ .github/workflows/  CI：Windows 安装包/zip + Linux deb/rpm/AppImage/tar.gz
 ├─ scripts/            构建 / 打包 / 验证脚本（见下）
-└─ build.rs            把 DLL 与 icon.ico 部署到 build_target/<profile>/
+└─ build.rs            Windows：DLL 与 icon.ico 部署；两端：前端产物内嵌资源表
 ```
 
 改动前后对照：`src`(Rust) → `src-rs`；`web/`(前端) → 项目根；`web/dist` → `build_dist`；`target/` → `build_target`。
@@ -395,9 +501,9 @@ SDK 来源：<https://github.com/weolar/miniblink49/releases>（tag `20251212`�
 
 ## 环境要求
 
-- Windows（miniblink 仅支持 Windows）
-- Rust 1.70+（MSVC 工具链，本项目用 1.99 验证）
-- Node 18+
+- Windows：miniblink 仅支持 Windows（Rust 1.70+ MSVC 工具链，本项目用 1.99 验证）
+- Linux：GTK3 + WebKitGTK 4.1 开发包（`libgtk-3-dev libwebkit2gtk-4.1-dev`，Ubuntu 22.04+）
+- Node 18+ / pnpm（前端）；打 deb/rpm 另需 cargo-deb / cargo-generate-rpm
 
 ## 常用参数
 
@@ -405,17 +511,22 @@ SDK 来源：<https://github.com/weolar/miniblink49/releases>（tag `20251212`�
 mbvue                      # 加载构建产物
 mbvue --dev                # 连 vite dev server (127.0.0.1:5173)
 mbvue --url https://baidu.com
-mbvue --dll <path>         # 指定 mb132_x64.dll
+mbvue --dll <path>         # 指定 mb132_x64.dll（仅 Windows）
 mbvue --web <dir>          # 指定前端产物目录
 ```
 
-环境变量：`MB_DLL` / `MB_WEB_ROOT` / `MB_PORT`
+环境变量：`MB_DLL` / `MB_WEB_ROOT` / `MB_PORT` / `MB_USER_DATA`
 
 ## 关于启动方式
 
-- 编译为 **Windows GUI 子系统**（`#![windows_subsystem = "windows"]`），双击 exe 直接启动，**不会弹出 cmd 控制台窗口**
-- 日志统一写到 `logs/mbvue.log`（每次启动截断重写），排查问题看这个文件
+- Windows 编译为 **GUI 子系统**（`#![windows_subsystem = "windows"]`，cfg_attr 只在
+  Windows 生效），双击 exe 直接启动，**不会弹出 cmd 控制台窗口**；Linux 是普通控制台
+  程序，stderr 直接可见
+- 日志：Windows 统一写 `logs/mbvue.log`、Linux 写 `<user_data>/mbvue.log`
+  （每次启动截断重写），排查问题看这个文件
 - `build_target/` 固定在本项目内（`.cargo/config.toml` + 脚本里的 `CARGO_TARGET_DIR`），项目可整体拷贝/清理
+- 平台壳拆分：窗口/托盘/内核加载在 `platform_win.rs` / `platform_linux.rs`，
+  共享逻辑（命令表 / HTTP 服务 / 配置）只有一份，见「Linux 支持」
 
 ## 说明
 

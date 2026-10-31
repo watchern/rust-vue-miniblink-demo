@@ -162,18 +162,18 @@ pub(crate) fn run(opts: Options) {
     let webview = WebView::with_user_content_manager(&ucm);
     win.add(&webview);
 
-    // eval 派发通道：后台线程 emit() → 这里 recv → 主线程 run_javascript。
+    // eval 派发通道：后台线程 emit() → attach 回调（主线程默认上下文）→ run_javascript。
     // 回包（__mbResolve）也走这条，与事件推送保持同一队列顺序。
-    // 持有 WebView 的 future 不是 Send，必须 spawn_local（挂主线程默认上下文）。
-    let (tx, rx) = glib::MainContext::channel::<String>(glib::PRIORITY_DEFAULT);
+    // 注意：glib 0.18 的 Receiver 只有 attach(FnMut) 回调式 API，没有 async recv；
+    // channel 的优先级用 Priority::DEFAULT（根命名空间没有 PRIORITY_DEFAULT 常量）。
+    let (tx, rx) = glib::MainContext::channel::<String>(glib::Priority::DEFAULT);
     let _ = JS_TX.set(Mutex::new(Some(tx)));
     {
         let webview = webview.clone();
-        glib::MainContext::default().spawn_local(async move {
-            while let Ok(js) = rx.recv().await {
-                // fire-and-forget：与 Windows 端 mbRunJs 的语义一致
-                webview.run_javascript(&js, Option::<&gtk::gio::Cancellable>::None, |_| {});
-            }
+        rx.attach(None, move |js| {
+            // fire-and-forget：与 Windows 端 mbRunJs 的语义一致
+            webview.run_javascript(&js, Option::<&gtk::gio::Cancellable>::None, |_| {});
+            glib::ControlFlow::Continue
         });
     }
 

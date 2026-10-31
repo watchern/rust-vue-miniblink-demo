@@ -13,6 +13,8 @@
 #   · GitHub 托管 Windows runner 已不预装 NSIS，需 choco install nsis
 #   · miniblink 68MB DLL 不进 git，CI 用 scripts/fetch-miniblink.sh 下载并缓存
 #   · Linux 端不依赖 miniblink（WebKitGTK 壳），无需下载 SDK
+#   · 关键构建步骤 tee 到日志文件，失败时把错误行转成 ::error:: annotation——
+#     annotation 匿名可读（走 API 不需要 token），便于 CI 之外定位问题
 name: build
 
 on:
@@ -72,7 +74,21 @@ jobs:
 
       - name: Build & package (NSIS setup.exe + portable dir)
         shell: bash
-        run: bash scripts/make_installer.sh
+        run: |
+          set -o pipefail
+          bash scripts/make_installer.sh 2>&1 | tee "$RUNNER_TEMP/installer.log"
+
+      - name: Report errors (annotations)
+        if: failure()
+        shell: bash
+        run: |
+          f="$RUNNER_TEMP/installer.log"
+          [[ -f "$f" ]] || { echo "::error::installer.log 不存在，失败发生在更早的命令"; exit 0; }
+          grep -aE "error(\[E[0-9]+\])?:|ERR_|cannot find|未找到|找不到|失败|Abort|panic" "$f" \
+            | tail -10 | cut -c1-380 | while IFS= read -r l; do
+              echo "::error::${l//%/％}"
+            done
+          echo "::error::（以上是末尾匹配行，完整输出见本步骤日志）"
 
       - name: Tests
         shell: bash
@@ -125,8 +141,21 @@ jobs:
       - name: pnpm install
         run: pnpm install --frozen-lockfile
 
+      # build.rs 在编译期把 build_dist/ 内嵌进 exe，前端必须先于 cargo build
+      - name: Build frontend
+        run: CI=true pnpm run build
+
       - name: Build
-        run: cargo build --release
+        run: |
+          set -o pipefail
+          cargo build --release 2>&1 | tee /tmp/build.log
+
+      - name: Report build errors (annotations)
+        if: failure()
+        run: |
+          [[ -f /tmp/build.log ]] || exit 0
+          grep -aE "^error|^warning: unused" /tmp/build.log | head -10 | cut -c1-380 \
+            | while IFS= read -r l; do echo "::error::${l//%/％}"; done
 
       - name: Tests
         run: cargo test --release
@@ -141,7 +170,18 @@ jobs:
         run: cargo install cargo-generate-rpm --locked
 
       - name: Package (deb / rpm / AppImage / tar.gz)
-        run: bash scripts/make_linux_pkgs.sh --no-build
+        run: |
+          set -o pipefail
+          bash scripts/make_linux_pkgs.sh --no-build 2>&1 | tee /tmp/pkg.log
+
+      - name: Report package errors (annotations)
+        if: failure()
+        run: |
+          [[ -f /tmp/pkg.log ]] || exit 0
+          grep -aE "error|ERROR|缺少|失败|FAILED|No such|not found" /tmp/pkg.log \
+            | tail -10 | cut -c1-380 | while IFS= read -r l; do
+              echo "::error::${l//%/％}"
+            done
 
       - uses: actions/upload-artifact@v4
         with:

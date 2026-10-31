@@ -3,6 +3,7 @@ name = "rust-vue-miniblink-demo"
 version = "0.1.0"
 edition = "2021"
 description = "miniblink(Chromium 132)/WebKitGTK + Vue 3 + Rust 桌面应用 Demo"
+license = "MIT"
 build = "build.rs"
 
 [[bin]]
@@ -46,6 +47,9 @@ opt-level = 2
 # ---- Linux 打包（deb：cargo-deb；rpm：cargo-generate-rpm）----
 # 产物由 scripts/make_linux_pkgs.sh / CI 生成，路径基于 .cargo/config.toml 的
 # target-dir（build_target/）。
+# depends 不用 $auto：Ubuntu 的 webkit shlibs 会让 cargo-deb 报
+# "Invalid dependency version specified for webkit2gtk4"（解析缺陷）。
+# libwebkit2gtk-4.1-0 经 dpkg 传递依赖带入 soup3 / glib / pango / cairo 等运行时。
 [package.metadata.deb]
 maintainer = "RPAN <rpan@localhost>"
 copyright = "2026, RPAN"
@@ -53,7 +57,7 @@ extended-description = """\
 mbvue 桌面应用骨架：Vue 3 界面 + Rust 原生宿主。
 Windows 端渲染内核为 miniblink(Chromium 132)，Linux 端为 WebKitGTK 4.1。
 JS <-> Rust 双向 IPC、无边框窗口、内嵌前端资源，见项目 README。"""
-depends = "$auto"
+depends = "libgtk-3-0, libwebkit2gtk-4.1-0"
 section = "utils"
 priority = "optional"
 assets = [

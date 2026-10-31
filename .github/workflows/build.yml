@@ -63,13 +63,14 @@ jobs:
         shell: bash
         run: bash scripts/fetch-miniblink.sh
 
-      # runner 镜像已不再预装 NSIS；choco 的 nsis 包会把 makensis 放进 PATH，
-      # make_installer.sh 的 find_makensis 优先认 PATH
+      # runner 镜像已不再预装 NSIS。choco 的 nsis 包改的是注册表 PATH，
+      # 当前 job 的环境快照看不到 → 装完显式写进 GITHUB_PATH（后续 step 生效）
       - name: Install NSIS
         shell: bash
         run: |
           if ! command -v makensis >/dev/null 2>&1; then
             choco install nsis -y --no-progress
+            echo 'C:\Program Files (x86)\NSIS' >> "$GITHUB_PATH"
           fi
 
       - name: Build & package (NSIS setup.exe + portable dir)
@@ -88,7 +89,10 @@ jobs:
             | tail -10 | cut -c1-380 | while IFS= read -r l; do
               echo "::error::${l//%/％}"
             done
-          echo "::error::（以上是末尾匹配行，完整输出见本步骤日志）"
+          echo "::error::—— installer.log 末尾原文 ——"
+          tail -c 2500 "$f" | grep -a . | tail -8 | cut -c1-380 | while IFS= read -r l; do
+            echo "::error::| ${l//%/％}"
+          done
 
       - name: Tests
         shell: bash
@@ -153,9 +157,15 @@ jobs:
       - name: Report build errors (annotations)
         if: failure()
         run: |
-          [[ -f /tmp/build.log ]] || exit 0
-          grep -aE "^error|^warning: unused" /tmp/build.log | head -10 | cut -c1-380 \
+          f=/tmp/build.log
+          [[ -f "$f" ]] || { echo "::error::build.log 不存在"; exit 0; }
+          grep -aE "^error|^warning: unused" "$f" | head -10 | cut -c1-380 \
             | while IFS= read -r l; do echo "::error::${l//%/％}"; done
+          # 无 error 前缀的失败（panic/被杀/脚本层错误）也要能看到现场
+          echo "::error::—— build.log $(wc -l < "$f") 行，末尾原文 ——"
+          tail -c 3000 "$f" | grep -a . | tail -10 | cut -c1-380 | while IFS= read -r l; do
+            echo "::error::| ${l//%/％}"
+          done
 
       - name: Tests
         run: cargo test --release
@@ -177,11 +187,16 @@ jobs:
       - name: Report package errors (annotations)
         if: failure()
         run: |
-          [[ -f /tmp/pkg.log ]] || exit 0
-          grep -aE "error|ERROR|缺少|失败|FAILED|No such|not found" /tmp/pkg.log \
+          f=/tmp/pkg.log
+          [[ -f "$f" ]] || { echo "::error::pkg.log 不存在"; exit 0; }
+          grep -aE "error|ERROR|缺少|失败|FAILED|No such|not found" "$f" \
             | tail -10 | cut -c1-380 | while IFS= read -r l; do
               echo "::error::${l//%/％}"
             done
+          echo "::error::—— pkg.log 末尾原文 ——"
+          tail -c 3000 "$f" | grep -a . | tail -10 | cut -c1-380 | while IFS= read -r l; do
+            echo "::error::| ${l//%/％}"
+          done
 
       - uses: actions/upload-artifact@v4
         with:

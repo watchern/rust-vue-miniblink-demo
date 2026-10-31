@@ -50,6 +50,10 @@ find_makensis() {
       return 0
     fi
   done
+  # choco / 独立安装器的标准位置（choco 修改的是注册表 PATH，当前进程看不到）
+  for p in "/c/Program Files (x86)/NSIS/makensis.exe" "/c/Program Files/NSIS/makensis.exe"; do
+    [[ -f "$p" ]] && { echo "$p"; return 0; }
+  done
   return 1
 }
 

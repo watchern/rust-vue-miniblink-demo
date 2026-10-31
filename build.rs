@@ -2,8 +2,12 @@
 //!
 //! 跨平台分工：
 //!   · 前端产物资源表（`$OUT_DIR/mb_assets.rs`）—— 两个平台共用；
-//!   · miniblink DLL 部署 / icon.rc 嵌入 / icon.ico 部署 —— 仅 Windows
-//!     （`CARGO_CFG_WINDOWS` 由 cargo 按 cfg 注入，Linux 构建自动跳过）。
+//!   · miniblink DLL 部署 / icon.rc 嵌入 / icon.ico 部署 —— 仅 Windows。
+//!
+//! Windows 专属代码必须用 `#[cfg(windows)]` **编译期**门控（build script 按
+//! host 平台编译）：embed-resource 在 Cargo.toml 里是
+//! `[target.'cfg(windows)'.build-dependencies]`，Linux 构建时该 crate 不在
+//! 依赖图里，只做运行时 if 判断会 E0433（unresolved crate，CI 实测踩过）。
 //!
 //! DLL 本体（68MB）放在 vendor/miniblink/ 下，不经 git 追踪，
 //! 首次获取方式见 scripts/fetch-miniblink.sh。
@@ -24,13 +28,13 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
 
-    // ---- Windows 专属：DLL 部署 + 图标 ----
-    if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
-        deploy_windows_runtime(&manifest, &out_dir);
-    }
+    // ---- Windows 专属：DLL 部署 + 图标（Linux 构建时不编译此分支）----
+    #[cfg(windows)]
+    deploy_windows_runtime(&manifest, &out_dir);
 }
 
 /// Windows：miniblink DLL 部署到 cargo 产物目录 + exe 图标资源 + 运行时窗口图标。
+#[cfg(windows)]
 fn deploy_windows_runtime(manifest: &Path, out_dir: &Path) {
     // DLL 部署
     let dll_names = ["mb132_x64.dll", "mb132_x32.dll"];

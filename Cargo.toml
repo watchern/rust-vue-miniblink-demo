@@ -76,7 +76,9 @@ assets = [
     { source = "assets/icon.png", dest = "/usr/share/icons/hicolor/256x256/apps/mbvue.png", mode = "644" },
     { source = "packaging/mbvue.desktop", dest = "/usr/share/applications/mbvue.desktop", mode = "644" },
 ]
-# Fedora/openSUSE 的运行时包名（webkit2gtk-4.1 在 Fedora 上叫 webkit2gtk4.1）
+# Fedora/openSUSE 的运行时包名（webkit2gtk-4.1 在 Fedora 上叫 webkit2gtk4.1）。
+# 注意：键名含点必须加引号，否则 TOML 会解析成嵌套表（webkit2gtk4 → 子表 1），
+# cargo-generate-rpm 报 "Invalid dependency version specified for webkit2gtk4"。
 [package.metadata.generate-rpm.requires]
 gtk3 = "*"
-webkit2gtk4.1 = "*"
+"webkit2gtk4.1" = "*"
